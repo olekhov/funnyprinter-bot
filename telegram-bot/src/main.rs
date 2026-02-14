@@ -7,10 +7,14 @@ use serde::{Deserialize, Serialize};
 use teloxide::{
     dispatching::UpdateFilterExt,
     prelude::*,
-    types::{InlineKeyboardButton, InlineKeyboardMarkup, InputFile},
+    types::{
+        InlineKeyboardButton, InlineKeyboardMarkup, InputFile, KeyboardButton, KeyboardMarkup,
+    },
     utils::command::BotCommands,
 };
 use tokio_rusqlite::{Connection, rusqlite};
+use tracing::{error, info, warn};
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Debug, Parser)]
 #[command(name = "telegram-bot")]
@@ -33,6 +37,7 @@ struct PrinterdConfig {
     base_url: String,
     api_token: Option<String>,
     address: Option<String>,
+    wait_job_timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -131,6 +136,12 @@ struct PrintResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct JobResponse {
+    status: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ApiErrorBody {
     error: String,
 }
@@ -150,6 +161,12 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_target(false)
+        .compact()
+        .init();
+
     let args = Args::parse();
     let cfg_raw = tokio::fs::read_to_string(&args.config)
         .await
@@ -204,6 +221,7 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
     let user_id = user.id.0 as i64;
 
     if !state.db.is_allowed(user_id).await.unwrap_or(false) {
+        warn!(user_id = user_id, "telegram user denied by allowlist");
         bot.send_message(
             msg.chat.id,
             format!("Доступ пользователя {user_id} запрещён."),
@@ -215,6 +233,11 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
     let Some(text) = msg.text() else {
         return Ok(());
     };
+
+    if let Some(cmd) = map_menu_button_to_command(text) {
+        handle_command(&bot, &msg, &state, user_id, cmd).await?;
+        return Ok(());
+    }
 
     if let Ok(cmd) = Command::parse(text, "bot") {
         handle_command(&bot, &msg, &state, user_id, cmd).await?;
@@ -229,6 +252,11 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
 
     match create_simple_sticker(&state, user_id, msg.chat.id.0, text).await {
         Ok(record) => {
+            info!(
+                user_id = user_id,
+                sticker_id = record.id,
+                "created sticker preview"
+            );
             let caption = format!(
                 "Превью стикера.\nШрифт: {:.1}px\nНажмите кнопку для печати.",
                 record.font_size_px
@@ -242,6 +270,7 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
             .await?;
         }
         Err(err) => {
+            error!(user_id = user_id, error = %err, "failed to create sticker preview");
             bot.send_message(msg.chat.id, format!("Ошибка рендера: {err}"))
                 .await?;
         }
@@ -261,8 +290,9 @@ async fn handle_command(
         Command::Help | Command::Start => {
             bot.send_message(
                 msg.chat.id,
-                "Отправьте текст (поддерживаются переносы строк) и бот пришлёт превью.\\nПосле подтверждения стикер будет отправлен на печать.",
+                "Отправьте текст (поддерживаются переносы строк) и бот пришлёт превью.\nПосле подтверждения стикер будет отправлен на печать.",
             )
+            .reply_markup(main_menu_keyboard())
             .await?;
         }
         Command::Simple => {
@@ -270,11 +300,14 @@ async fn handle_command(
                 msg.chat.id,
                 "Режим: простой стикер. Просто отправьте текст следующим сообщением.",
             )
+            .reply_markup(main_menu_keyboard())
             .await?;
         }
         Command::History => match state.db.list_recent_for_user(user_id, 10).await {
             Ok(items) if items.is_empty() => {
-                bot.send_message(msg.chat.id, "История пуста.").await?;
+                bot.send_message(msg.chat.id, "История пуста.")
+                    .reply_markup(main_menu_keyboard())
+                    .await?;
             }
             Ok(items) => {
                 for item in items {
@@ -284,12 +317,16 @@ async fn handle_command(
                         InputFile::memory(item.preview_png.clone()).file_name("preview.png"),
                     )
                     .caption(caption)
-                    .reply_markup(reprint_keyboard(item.id))
+                    .reply_markup(history_item_keyboard(item.id))
                     .await?;
                 }
+                bot.send_message(msg.chat.id, "Действия с историей:")
+                    .reply_markup(clear_history_keyboard())
+                    .await?;
             }
             Err(err) => {
                 bot.send_message(msg.chat.id, format!("Ошибка чтения истории: {err}"))
+                    .reply_markup(main_menu_keyboard())
                     .await?;
             }
         },
@@ -312,16 +349,63 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
         return Ok(());
     };
 
+    if data == "clear_history" {
+        match state.db.clear_history_for_user(user_id).await {
+            Ok(count) => {
+                bot.answer_callback_query(q.id)
+                    .text(format!("Удалено из истории: {count}"))
+                    .await?;
+            }
+            Err(err) => {
+                bot.answer_callback_query(q.id)
+                    .show_alert(true)
+                    .text(format!("Ошибка очистки: {err}"))
+                    .await?;
+            }
+        }
+        return Ok(());
+    }
+
     let Some((action, id_str)) = data.split_once(':') else {
         return Ok(());
     };
-    if action != "print" && action != "reprint" {
+    if action != "print" && action != "reprint" && action != "delete" {
         return Ok(());
     }
 
     let Ok(sticker_id) = id_str.parse::<i64>() else {
         return Ok(());
     };
+
+    if action == "delete" {
+        let result = state.db.delete_sticker_for_user(sticker_id, user_id).await;
+        match result {
+            Ok(true) => {
+                bot.answer_callback_query(q.id.clone())
+                    .text("Удалено из истории")
+                    .await?;
+                if let Some(message) = q.message {
+                    let _ = bot
+                        .edit_message_reply_markup(message.chat().id, message.id())
+                        .reply_markup(InlineKeyboardMarkup::default())
+                        .await;
+                }
+            }
+            Ok(false) => {
+                bot.answer_callback_query(q.id)
+                    .show_alert(true)
+                    .text("Не найдено")
+                    .await?;
+            }
+            Err(err) => {
+                bot.answer_callback_query(q.id)
+                    .show_alert(true)
+                    .text(format!("Ошибка удаления: {err}"))
+                    .await?;
+            }
+        }
+        return Ok(());
+    }
 
     let result = process_print_action(&state, user_id, sticker_id).await;
 
@@ -333,7 +417,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
             if let Some(message) = q.message {
                 let _ = bot
                     .edit_message_reply_markup(message.chat().id, message.id())
-                    .reply_markup(reprint_keyboard(sticker_id))
+                    .reply_markup(history_item_keyboard(sticker_id))
                     .await;
             }
         }
@@ -461,10 +545,32 @@ async fn process_print_action(state: &AppState, user_id: i64, sticker_id: i64) -
         )
         .await?;
 
+    let wait_timeout = state.cfg.printerd.wait_job_timeout_seconds.unwrap_or(20);
+    let job = state
+        .printerd
+        .wait_job(&print_resp.job_id, wait_timeout)
+        .await?;
+    if job.status == "failed" {
+        bail!(
+            "принтер вернул ошибку: {}",
+            job.error.unwrap_or_else(|| "unknown".to_string())
+        );
+    }
+    if job.status != "done" {
+        bail!("печать не завершилась вовремя, статус: {}", job.status);
+    }
+
     state
         .db
         .set_last_print_job(sticker_id, &print_resp.job_id)
         .await?;
+
+    info!(
+        user_id = user_id,
+        sticker_id = sticker_id,
+        job_id = %print_resp.job_id,
+        "sticker printed"
+    );
 
     Ok(print_resp.job_id)
 }
@@ -539,11 +645,44 @@ fn print_keyboard(sticker_id: i64) -> InlineKeyboardMarkup {
     )]])
 }
 
-fn reprint_keyboard(sticker_id: i64) -> InlineKeyboardMarkup {
+fn history_item_keyboard(sticker_id: i64) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(
+            "Напечатать ещё раз",
+            format!("reprint:{sticker_id}"),
+        )],
+        vec![InlineKeyboardButton::callback(
+            "Удалить из истории",
+            format!("delete:{sticker_id}"),
+        )],
+    ])
+}
+
+fn clear_history_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
-        "Напечатать ещё раз",
-        format!("reprint:{sticker_id}"),
+        "Очистить всю историю",
+        "clear_history",
     )]])
+}
+
+fn main_menu_keyboard() -> KeyboardMarkup {
+    KeyboardMarkup::new(vec![
+        vec![
+            KeyboardButton::new("🆘 Помощь"),
+            KeyboardButton::new("🗂 История"),
+        ],
+        vec![KeyboardButton::new("🏷 Простой стикер")],
+    ])
+    .resize_keyboard()
+}
+
+fn map_menu_button_to_command(text: &str) -> Option<Command> {
+    match text.trim() {
+        "🆘 Помощь" => Some(Command::Help),
+        "🗂 История" => Some(Command::History),
+        "🏷 Простой стикер" => Some(Command::Simple),
+        _ => None,
+    }
 }
 
 impl PrinterdClient {
@@ -605,6 +744,21 @@ impl PrinterdClient {
             request = request.header("x-api-token", token);
         }
         let resp = request.send().await.context("print request failed")?;
+        parse_json_response(resp).await
+    }
+
+    async fn wait_job(&self, job_id: &str, timeout_seconds: u64) -> Result<JobResponse> {
+        let url = format!(
+            "{}/api/v1/jobs/{}/wait?timeout_seconds={}",
+            self.base_url,
+            job_id,
+            timeout_seconds.clamp(1, 120)
+        );
+        let mut request = self.http.get(url);
+        if let Some(token) = &self.token {
+            request = request.header("x-api-token", token);
+        }
+        let resp = request.send().await.context("wait job request failed")?;
         parse_json_response(resp).await
     }
 }
@@ -843,5 +997,28 @@ impl Db {
             })
             .await
             .map_err(|e| anyhow!("failed to update print job id: {e}"))
+    }
+
+    async fn delete_sticker_for_user(&self, id: i64, user_id: i64) -> Result<bool> {
+        self.conn
+            .call(move |conn| -> rusqlite::Result<bool> {
+                let changed = conn.execute(
+                    "DELETE FROM stickers WHERE id = ?1 AND user_id = ?2",
+                    (id, user_id),
+                )?;
+                Ok(changed > 0)
+            })
+            .await
+            .map_err(|e| anyhow!("failed to delete history item: {e}"))
+    }
+
+    async fn clear_history_for_user(&self, user_id: i64) -> Result<u64> {
+        self.conn
+            .call(move |conn| -> rusqlite::Result<u64> {
+                let changed = conn.execute("DELETE FROM stickers WHERE user_id = ?1", [user_id])?;
+                Ok(changed as u64)
+            })
+            .await
+            .map_err(|e| anyhow!("failed to clear history: {e}"))
     }
 }

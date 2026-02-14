@@ -63,6 +63,10 @@ cargo run -p printerd -- \
   --listen 0.0.0.0:8080 \
   --default-address C0:00:00:00:06:B3
 ```
+Structured logs with tracing:
+```bash
+RUST_LOG=info cargo run -p printerd -- --listen 0.0.0.0:8080 --default-address C0:00:00:00:06:B3
+```
 
 Optional auth token:
 
@@ -106,6 +110,11 @@ curl -sS -X POST http://<pi-ip>:8080/api/v1/print \
 curl -sS http://<pi-ip>:8080/api/v1/jobs/j_1
 ```
 
+5. Wait for completion/failure (useful for bot feedback):
+```bash
+curl -sS "http://<pi-ip>:8080/api/v1/jobs/j_1/wait?timeout_seconds=20"
+```
+
 ## Telegram Bot
 
 The bot uses `printerd` as rendering/printing backend and keeps history in SQLite, so previews and reprint buttons survive bot restarts.
@@ -117,6 +126,10 @@ cp telegram-bot/bot-config.example.toml bot-config.toml
 $EDITOR bot-config.toml
 cargo run -p telegram-bot -- --config bot-config.toml
 ```
+Tracing logs:
+```bash
+RUST_LOG=info cargo run -p telegram-bot -- --config bot-config.toml
+```
 
 ### Simple Sticker flow
 
@@ -126,6 +139,7 @@ cargo run -p telegram-bot -- --config bot-config.toml
 4. User presses `Печатать`.
 5. Bot re-renders by saved parameters and sends print request.
 6. Button becomes `Напечатать ещё раз` for quick reprint.
+7. Bot shows menu buttons (`Помощь`, `История`, `Простой стикер`) as reply keyboard.
 
 ### Access control
 
@@ -140,3 +154,10 @@ sqlite3 printerbot.sqlite3 "DELETE FROM allowed_users WHERE user_id = 123456789;
 ```
 
 To get your Telegram user id, send `/start` to `@userinfobot` (or similar bot), then add that id.
+
+### History actions
+
+- Each history preview has:
+  - `Напечатать ещё раз`
+  - `Удалить из истории`
+- History screen also has `Очистить всю историю` (only for current user history).

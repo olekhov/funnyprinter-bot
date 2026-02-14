@@ -23,3 +23,5 @@ clap = { version = "4", features = ["derive"] }
 image = "0.25"
 imageproc = "0.25"
 ab_glyph = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
