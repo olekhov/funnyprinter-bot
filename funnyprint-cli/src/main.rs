@@ -28,6 +28,8 @@ enum Command {
         font: PathBuf,
         #[arg(long, default_value_t = 48.0)]
         font_size: f32,
+        #[arg(long, default_value_t = 1.0)]
+        line_spacing: f32,
         #[arg(long, default_value_t = 0)]
         x: i32,
         #[arg(long, default_value_t = 0)]
@@ -75,6 +77,7 @@ async fn main() -> Result<()> {
             text,
             font,
             font_size,
+            line_spacing,
             x,
             y,
             width,
@@ -101,6 +104,7 @@ async fn main() -> Result<()> {
                 x_px: x,
                 y_px: y,
                 font_size_px: font_size,
+                line_spacing,
                 threshold,
                 invert,
                 trim_blank_top_bottom: !no_trim_blank,

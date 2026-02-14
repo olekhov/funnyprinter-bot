@@ -1,0 +1,25 @@
+telegram_token = "123456:replace_me"
+sqlite_path = "./printerbot.sqlite3"
+
+[printerd]
+base_url = "http://127.0.0.1:8080"
+api_token = "change-me"
+address = "C0:00:00:00:06:B3"
+
+[sticker]
+font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+printer_width_px = 384
+margin_left_px = 10
+margin_right_px = 10
+margin_top_px = 12
+margin_bottom_px = 12
+min_font_size_px = 14.0
+max_font_size_px = 92.0
+line_spacing = 1.1
+threshold = 180
+density = 3
+invert = false
+trim_blank_top_bottom = true
+
+[access]
+allowed_user_ids = [123456789, 987654321]

@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use ab_glyph::{FontArc, PxScale};
+use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use anyhow::{Context, Result};
 use funnyprint_proto::{BYTES_PER_LINE, MAX_DOTS_PER_LINE, PackedLine};
 use image::{GrayImage, Luma};
@@ -13,6 +13,7 @@ pub struct TextRenderOptions {
     pub x_px: i32,
     pub y_px: i32,
     pub font_size_px: f32,
+    pub line_spacing: f32,
     pub threshold: u8,
     pub invert: bool,
     pub trim_blank_top_bottom: bool,
@@ -26,6 +27,7 @@ impl Default for TextRenderOptions {
             x_px: 0,
             y_px: 0,
             font_size_px: 48.0,
+            line_spacing: 1.0,
             threshold: 180,
             invert: false,
             trim_blank_top_bottom: true,
@@ -43,15 +45,18 @@ pub fn render_text_to_image(
     let font = FontArc::try_from_vec(bytes).context("failed to parse font")?;
 
     let mut img = GrayImage::from_pixel(opts.width_px, opts.height_px, Luma([255]));
-    draw_text_mut(
-        &mut img,
-        Luma([0]),
-        opts.x_px,
-        opts.y_px,
-        PxScale::from(opts.font_size_px),
-        &font,
-        text,
-    );
+    let scale = PxScale::from(opts.font_size_px);
+    let scaled = font.as_scaled(scale);
+    let line_h =
+        ((scaled.ascent() - scaled.descent() + scaled.line_gap()) * opts.line_spacing).max(1.0);
+
+    for (idx, line) in text.split('\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let y = opts.y_px + (idx as f32 * line_h).round() as i32;
+        draw_text_mut(&mut img, Luma([0]), opts.x_px, y, scale, &font, line);
+    }
 
     if opts.invert {
         for pixel in img.pixels_mut() {
