@@ -12,7 +12,7 @@ use std::{
 
 use axum::{
     Router,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -27,6 +27,8 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
+const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Parser)]
 #[command(name = "printerd")]
 #[command(about = "HTTP print daemon for FunnyPrint BLE printers")]
@@ -37,6 +39,8 @@ struct Args {
     default_address: Option<String>,
     #[arg(long)]
     api_token: Option<String>,
+    #[arg(long)]
+    debug_image_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -48,6 +52,7 @@ struct AppState {
     render_seq: Arc<AtomicU64>,
     job_seq: Arc<AtomicU64>,
     queue_tx: mpsc::Sender<PrintCommand>,
+    debug_image_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -188,6 +193,7 @@ async fn main() -> anyhow::Result<()> {
         render_seq: Arc::new(AtomicU64::new(1)),
         job_seq: Arc::new(AtomicU64::new(1)),
         queue_tx: tx,
+        debug_image_dir: args.debug_image_dir,
     };
 
     tokio::spawn(worker_loop(state.clone(), rx));
@@ -201,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/print", post(queue_print))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/wait", get(wait_job))
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
@@ -361,6 +368,7 @@ async fn render_image(
             format!("width_px must be in 1..={}", MAX_DOTS_PER_LINE),
         );
     }
+    let render_id = next_id("r", &state.render_seq);
 
     let image_bytes = match base64::engine::general_purpose::STANDARD.decode(req.image_base64) {
         Ok(v) => v,
@@ -383,6 +391,12 @@ async fn render_image(
     };
 
     let gray = dyn_img.to_luma8();
+    maybe_dump_debug_image(
+        state.debug_image_dir.as_deref(),
+        &render_id,
+        "src_gray",
+        &gray,
+    );
     let src_w = gray.width().max(1);
     let src_h = gray.height().max(1);
     let mut target_h = ((src_h as f32 * width_px as f32) / src_w as f32).round() as u32;
@@ -392,12 +406,24 @@ async fn render_image(
     }
 
     let resized = image::imageops::resize(&gray, width_px, target_h, FilterType::Lanczos3);
+    maybe_dump_debug_image(
+        state.debug_image_dir.as_deref(),
+        &render_id,
+        "resized_gray",
+        &resized,
+    );
     let threshold = req.threshold.unwrap_or(180);
     let dither = req.dither_method.unwrap_or(DitherMethod::FloydSteinberg);
     let invert = req.invert.unwrap_or(false);
     let trim_blank = req.trim_blank_top_bottom.unwrap_or(true);
 
     let bw_preview = binarize_preview(&resized, threshold, dither, invert);
+    maybe_dump_debug_image(
+        state.debug_image_dir.as_deref(),
+        &render_id,
+        "bw_preview",
+        &bw_preview,
+    );
     let packed_lines = pack_bw_image(&bw_preview, trim_blank);
     if packed_lines.is_empty() {
         return error_response(
@@ -424,7 +450,6 @@ async fn render_image(
         );
     }
 
-    let render_id = next_id("r", &state.render_seq);
     let artifact = RenderArtifact {
         preview_png,
         packed_lines: packed_lines.clone(),
@@ -656,6 +681,30 @@ fn encode_png(image: &GrayImage) -> anyhow::Result<Vec<u8>> {
     let mut cursor = Cursor::new(Vec::<u8>::new());
     dyn_img.write_to(&mut cursor, ImageFormat::Png)?;
     Ok(cursor.into_inner())
+}
+
+fn maybe_dump_debug_image(debug_dir: Option<&std::path::Path>, render_id: &str, stage: &str, image: &GrayImage) {
+    let Some(debug_dir) = debug_dir else {
+        return;
+    };
+    let target_dir = debug_dir.join(render_id);
+    if let Err(err) = std::fs::create_dir_all(&target_dir) {
+        warn!(render_id = %render_id, path = %target_dir.display(), error = %err, "failed to create debug image dir");
+        return;
+    }
+    let out_path = target_dir.join(format!("{stage}.png"));
+    match encode_png(image) {
+        Ok(bytes) => {
+            if let Err(err) = std::fs::write(&out_path, bytes) {
+                warn!(render_id = %render_id, path = %out_path.display(), error = %err, "failed to write debug image");
+            } else {
+                info!(render_id = %render_id, stage = stage, path = %out_path.display(), "saved debug image");
+            }
+        }
+        Err(err) => {
+            warn!(render_id = %render_id, stage = stage, error = %err, "failed to encode debug image");
+        }
+    }
 }
 
 fn binarize_preview(

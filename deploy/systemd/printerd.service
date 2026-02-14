@@ -1,0 +1,22 @@
+[Unit]
+Description=Printerbot printerd (BLE print daemon)
+After=network-online.target bluetooth.service
+Wants=network-online.target bluetooth.service
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/opt/printerbot
+EnvironmentFile=/etc/printerbot/printerd.env
+ExecStart=/bin/sh -c '/opt/printerbot/bin/printerd --listen "${PRINTERD_LISTEN}" ${PRINTERD_DEFAULT_ADDRESS:+--default-address "${PRINTERD_DEFAULT_ADDRESS}"} ${PRINTERD_API_TOKEN:+--api-token "${PRINTERD_API_TOKEN}"}'
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/printerbot
+
+[Install]
+WantedBy=multi-user.target

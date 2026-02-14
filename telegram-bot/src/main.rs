@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use anyhow::{Context, Result, anyhow, bail};
@@ -9,10 +9,12 @@ use teloxide::{
     dispatching::UpdateFilterExt,
     prelude::*,
     types::{
-        InlineKeyboardButton, InlineKeyboardMarkup, InputFile, KeyboardButton, KeyboardMarkup,
+        ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, KeyboardButton,
+        KeyboardMarkup,
     },
     utils::command::BotCommands,
 };
+use tokio::sync::RwLock;
 use tokio_rusqlite::{Connection, rusqlite};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -29,6 +31,7 @@ struct Config {
     telegram_token: String,
     sqlite_path: String,
     printerd: PrinterdConfig,
+    ai_service: AiServiceConfig,
     sticker: StickerConfig,
     image_sticker: ImageStickerConfig,
     access: AccessConfig,
@@ -80,12 +83,28 @@ struct AccessConfig {
     allowed_user_ids: Vec<i64>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct AiServiceConfig {
+    base_url: String,
+    api_token: Option<String>,
+    default_size: Option<String>,
+    default_quality: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    SimpleText,
+    AiImage,
+}
+
 #[derive(Clone)]
 struct AppState {
     cfg: Config,
     db: Db,
     printerd: PrinterdClient,
+    ai: AiServiceClient,
     font: FontArc,
+    user_modes: Arc<RwLock<std::collections::HashMap<i64, InputMode>>>,
 }
 
 #[derive(Clone)]
@@ -99,6 +118,15 @@ struct PrinterdClient {
     base_url: String,
     token: Option<String>,
     default_address: Option<String>,
+}
+
+#[derive(Clone)]
+struct AiServiceClient {
+    http: reqwest::Client,
+    base_url: String,
+    token: Option<String>,
+    default_size: String,
+    default_quality: String,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +194,20 @@ struct RenderImageRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct AiGenerateRequest {
+    prompt: String,
+    size: String,
+    quality: String,
+    n: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct AiGenerateResponse {
+    image_base64: String,
+    revised_prompt: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct PrintRequest {
     render_id: String,
     address: Option<String>,
@@ -197,6 +239,8 @@ enum Command {
     Start,
     #[command(description = "режим простого стикера")]
     Simple,
+    #[command(description = "режим ИИ картинки")]
+    Ai,
     #[command(description = "последние стикеры")]
     History,
 }
@@ -235,12 +279,15 @@ async fn main() -> Result<()> {
     db.sync_allowlist(&cfg.access.allowed_user_ids).await?;
 
     let printerd = PrinterdClient::new(cfg.printerd.clone());
+    let ai = AiServiceClient::new(cfg.ai_service.clone());
 
     let state = Arc::new(AppState {
         cfg: cfg.clone(),
         db,
         printerd,
+        ai,
         font,
+        user_modes: Arc::new(RwLock::new(std::collections::HashMap::new())),
     });
 
     let bot = Bot::new(cfg.telegram_token);
@@ -292,29 +339,96 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
             return Ok(());
         }
 
-        match create_simple_sticker(&state, user_id, msg.chat.id.0, text).await {
-            Ok(record) => {
-                info!(
-                    user_id = user_id,
-                    sticker_id = record.id,
-                    "created text sticker preview"
-                );
-                let caption = format!(
-                    "Превью стикера.\nШрифт: {:.1}px\nНажмите кнопку для печати.",
-                    record.font_size_px
-                );
-                bot.send_photo(
-                    msg.chat.id,
-                    InputFile::memory(record.preview_png.clone()).file_name("preview.png"),
-                )
-                .caption(caption)
-                .reply_markup(print_keyboard(record.id))
-                .await?;
+        let mode = {
+            let modes = state.user_modes.read().await;
+            modes
+                .get(&user_id)
+                .copied()
+                .unwrap_or(InputMode::SimpleText)
+        };
+
+        match mode {
+            InputMode::SimpleText => {
+                match create_simple_sticker(&state, user_id, msg.chat.id.0, text).await {
+                    Ok(record) => {
+                        info!(
+                            user_id = user_id,
+                            sticker_id = record.id,
+                            "created text sticker preview"
+                        );
+                        let caption = format!(
+                            "Превью стикера.\nШрифт: {:.1}px\nНажмите кнопку для печати.",
+                            record.font_size_px
+                        );
+                        bot.send_photo(
+                            msg.chat.id,
+                            InputFile::memory(record.preview_png.clone()).file_name("preview.png"),
+                        )
+                        .caption(caption)
+                        .reply_markup(print_keyboard(record.id))
+                        .await?;
+                    }
+                    Err(err) => {
+                        error!(user_id = user_id, error = %err, "failed to create text sticker preview");
+                        bot.send_message(msg.chat.id, format!("Ошибка рендера: {err}"))
+                            .await?;
+                    }
+                }
             }
-            Err(err) => {
-                error!(user_id = user_id, error = %err, "failed to create text sticker preview");
-                bot.send_message(msg.chat.id, format!("Ошибка рендера: {err}"))
-                    .await?;
+            InputMode::AiImage => {
+                let progress_msg = bot
+                    .send_message(msg.chat.id, "Готовится изображение...")
+                    .await
+                    .ok();
+                let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+                let bot_for_action = bot.clone();
+                let chat_id = msg.chat.id;
+                tokio::spawn(async move {
+                    loop {
+                        let _ = bot_for_action
+                            .send_chat_action(chat_id, ChatAction::UploadPhoto)
+                            .await;
+                        tokio::select! {
+                            _ = &mut stop_rx => break,
+                            _ = tokio::time::sleep(Duration::from_secs(4)) => {}
+                        }
+                    }
+                });
+
+                match create_ai_image_sticker(&state, user_id, msg.chat.id.0, text).await {
+                    Ok((record, revised_prompt)) => {
+                        let _ = stop_tx.send(());
+                        if let Some(progress_msg) = progress_msg {
+                            let _ = bot.delete_message(msg.chat.id, progress_msg.id).await;
+                        }
+                        info!(
+                            user_id = user_id,
+                            sticker_id = record.id,
+                            "created ai sticker preview"
+                        );
+                        let mut caption = String::from("Превью ИИ-изображения для печати.");
+                        if let Some(rp) = revised_prompt {
+                            caption.push_str("\nУточнённый промпт: ");
+                            caption.push_str(&rp);
+                        }
+                        bot.send_photo(
+                            msg.chat.id,
+                            InputFile::memory(record.preview_png.clone()).file_name("preview.png"),
+                        )
+                        .caption(caption)
+                        .reply_markup(print_keyboard(record.id))
+                        .await?;
+                    }
+                    Err(err) => {
+                        let _ = stop_tx.send(());
+                        if let Some(progress_msg) = progress_msg {
+                            let _ = bot.delete_message(msg.chat.id, progress_msg.id).await;
+                        }
+                        error!(user_id = user_id, error = %err, "failed to create ai sticker preview");
+                        bot.send_message(msg.chat.id, format!("Ошибка AI генерации: {err}"))
+                            .await?;
+                    }
+                }
             }
         }
         return Ok(());
@@ -360,15 +474,31 @@ async fn handle_command(
         Command::Help | Command::Start => {
             bot.send_message(
                 msg.chat.id,
-                "Отправьте текст (поддерживаются переносы строк) ИЛИ изображение.\nБот пришлёт превью, после подтверждения стикер будет отправлен на печать.",
+                "Режимы:\n• 🏷 Простой стикер: отправьте текст.\n• 🤖 ИИ картинка: отправьте описание изображения.\nТакже можно отправить готовую картинку.\nПосле превью нажмите Печатать.",
             )
             .reply_markup(main_menu_keyboard())
             .await?;
         }
         Command::Simple => {
+            {
+                let mut modes = state.user_modes.write().await;
+                modes.insert(user_id, InputMode::SimpleText);
+            }
             bot.send_message(
                 msg.chat.id,
                 "Режим: простой стикер. Просто отправьте текст следующим сообщением.",
+            )
+            .reply_markup(main_menu_keyboard())
+            .await?;
+        }
+        Command::Ai => {
+            {
+                let mut modes = state.user_modes.write().await;
+                modes.insert(user_id, InputMode::AiImage);
+            }
+            bot.send_message(
+                msg.chat.id,
+                "Режим: ИИ картинка. Отправьте текст-описание изображения, и я сгенерирую превью для печати.",
             )
             .reply_markup(main_menu_keyboard())
             .await?;
@@ -381,11 +511,7 @@ async fn handle_command(
             }
             Ok(items) => {
                 for item in items {
-                    let title = match item.kind {
-                        StickerKind::Text => item.text.clone(),
-                        StickerKind::Image => "Изображение".to_string(),
-                    };
-                    let caption = format!("{}\n{}", item.created_at, title);
+                    let caption = format!("{}\n{}", item.created_at, item.text);
                     bot.send_photo(
                         msg.chat.id,
                         InputFile::memory(item.preview_png.clone()).file_name("preview.png"),
@@ -615,16 +741,76 @@ async fn create_image_sticker(
         .bytes()
         .await
         .context("failed to read telegram image body")?;
-    let source = bytes.to_vec();
+    create_image_sticker_from_bytes(state, user_id, chat_id, "Изображение", bytes.to_vec()).await
+}
 
+async fn create_ai_image_sticker(
+    state: &AppState,
+    user_id: i64,
+    chat_id: i64,
+    prompt: &str,
+) -> Result<(StickerRecord, Option<String>)> {
+    let ai_prompt = build_ai_lineart_prompt(prompt);
+    let ai = state.ai.generate(&ai_prompt).await?;
+    let source = base64::engine::general_purpose::STANDARD
+        .decode(ai.image_base64.as_bytes())
+        .context("ai-service returned invalid base64 image")?;
+    let title = format!("AI: {prompt}");
+    let image_cfg = &state.cfg.image_sticker;
+    let ai_threshold = image_cfg.threshold.max(200);
+    let sticker = create_image_sticker_from_bytes_with_options(
+        state,
+        user_id,
+        chat_id,
+        &title,
+        source,
+        ai_threshold,
+        DitherMethod::Threshold,
+        false,
+    )
+    .await?;
+    Ok((sticker, ai.revised_prompt))
+}
+
+async fn create_image_sticker_from_bytes(
+    state: &AppState,
+    user_id: i64,
+    chat_id: i64,
+    title: &str,
+    source: Vec<u8>,
+) -> Result<StickerRecord> {
+    let image_cfg = &state.cfg.image_sticker;
+    create_image_sticker_from_bytes_with_options(
+        state,
+        user_id,
+        chat_id,
+        title,
+        source,
+        image_cfg.threshold,
+        image_cfg.dither_method,
+        image_cfg.invert,
+    )
+    .await
+}
+
+async fn create_image_sticker_from_bytes_with_options(
+    state: &AppState,
+    user_id: i64,
+    chat_id: i64,
+    title: &str,
+    source: Vec<u8>,
+    threshold: u8,
+    dither_method: DitherMethod,
+    invert: bool,
+) -> Result<StickerRecord> {
     let image_cfg = &state.cfg.image_sticker;
     let req = RenderImageRequest {
         image_base64: base64::engine::general_purpose::STANDARD.encode(&source),
         width_px: state.cfg.sticker.printer_width_px,
         max_height_px: None,
-        threshold: image_cfg.threshold,
-        dither_method: image_cfg.dither_method,
-        invert: image_cfg.invert,
+        threshold,
+        dither_method,
+        invert,
         trim_blank_top_bottom: image_cfg.trim_blank_top_bottom,
         density: image_cfg.density,
         address: state.cfg.printerd.address.clone(),
@@ -639,7 +825,7 @@ async fn create_image_sticker(
             user_id,
             chat_id,
             kind: StickerKind::Image,
-            text: "Изображение".to_string(),
+            text: title.to_string(),
             width_px: render.width_px,
             height_px: render.height_px,
             x_px: 0,
@@ -658,7 +844,7 @@ async fn create_image_sticker(
     Ok(StickerRecord {
         id,
         kind: StickerKind::Image,
-        text: "Изображение".to_string(),
+        text: title.to_string(),
         width_px: render.width_px,
         height_px: render.height_px,
         x_px: 0,
@@ -793,6 +979,16 @@ fn fit_font_size(
     Ok((lo, h.max(min_h)))
 }
 
+fn build_ai_lineart_prompt(user_prompt: &str) -> String {
+    format!(
+        "Create black ink line art for thermal sticker printing. \
+Pure white background. Thin clean outlines. \
+No shading, no gray tones, no gradients, no fill textures, no color, no text. \
+Centered composition with clear silhouette. Subject: {}",
+        user_prompt
+    )
+}
+
 fn measure_text_block(font: &FontArc, text: &str, font_size: f32, line_spacing: f32) -> (f32, f32) {
     let scale = PxScale::from(font_size);
     let scaled = font.as_scaled(scale);
@@ -855,7 +1051,10 @@ fn main_menu_keyboard() -> KeyboardMarkup {
             KeyboardButton::new("🆘 Помощь"),
             KeyboardButton::new("🗂 История"),
         ],
-        vec![KeyboardButton::new("🏷 Простой стикер")],
+        vec![
+            KeyboardButton::new("🏷 Простой стикер"),
+            KeyboardButton::new("🤖 ИИ картинка"),
+        ],
     ])
     .resize_keyboard()
 }
@@ -865,6 +1064,7 @@ fn map_menu_button_to_command(text: &str) -> Option<Command> {
         "🆘 Помощь" => Some(Command::Help),
         "🗂 История" => Some(Command::History),
         "🏷 Простой стикер" => Some(Command::Simple),
+        "🤖 ИИ картинка" => Some(Command::Ai),
         _ => None,
     }
 }
@@ -972,6 +1172,36 @@ impl PrinterdClient {
             request = request.header("x-api-token", token);
         }
         let resp = request.send().await.context("wait job request failed")?;
+        parse_json_response(resp).await
+    }
+}
+
+impl AiServiceClient {
+    fn new(cfg: AiServiceConfig) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base_url: cfg.base_url.trim_end_matches('/').to_string(),
+            token: cfg.api_token,
+            default_size: cfg.default_size.unwrap_or_else(|| "1024x1024".to_string()),
+            default_quality: cfg.default_quality.unwrap_or_else(|| "low".to_string()),
+        }
+    }
+
+    async fn generate(&self, prompt: &str) -> Result<AiGenerateResponse> {
+        let req = AiGenerateRequest {
+            prompt: prompt.to_string(),
+            size: self.default_size.clone(),
+            quality: self.default_quality.clone(),
+            n: 1,
+        };
+        let mut request = self
+            .http
+            .post(format!("{}/api/v1/generate", self.base_url))
+            .json(&req);
+        if let Some(token) = &self.token {
+            request = request.header("x-api-token", token);
+        }
+        let resp = request.send().await.context("ai-service request failed")?;
         parse_json_response(resp).await
     }
 }

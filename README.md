@@ -11,6 +11,7 @@ Protocol reversed by [ValdikSS](https://github.com/ValdikSS/printer-driver-funny
 - `funnyprint-cli`: CLI for scanning BLE printers and printing text with PNG preview output.
 - `printerd`: HTTP daemon with render cache, preview endpoint and queued print jobs.
 - `telegram-bot`: Telegram UI over `printerd` with confirm-print flow and persistent history in SQLite.
+- `ai-service`: HTTP service for AI image generation (currently OpenAI `gpt-image-1-mini`).
 
 ## Driver-derived printer facts
 
@@ -138,6 +139,38 @@ Tracing logs:
 RUST_LOG=info cargo run -p telegram-bot -- --config bot-config.toml
 ```
 
+## ai-service
+
+Run:
+
+```bash
+OPENAI_API_KEY=sk-... \
+RUST_LOG=info \
+cargo run -p ai-service -- --listen 0.0.0.0:8090
+```
+
+Generate image from text prompt:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8090/api/v1/generate \
+  -H 'content-type: application/json' \
+  -d '{"prompt":"огурцы и помидоры, minimal line art", "size":"1024x1024", "quality":"low"}'
+```
+
+Response contains `image_base64`, which can be forwarded to `printerd /api/v1/renders/image`.
+
+## Deployment Files
+
+Prepared deployment files are in `deploy/`:
+
+- `deploy/docker-compose.yml` (single shared image, separate services for `telegram-bot` and `ai-service`)
+- `deploy/docker/Dockerfile.app` (builds both binaries in one image)
+- `deploy/systemd/printerd.service` for host BLE daemon
+- `deploy/systemd/printerd.env.example`
+- `deploy/bot-config.docker.example.toml`
+- `deploy/.env.example`
+- `deploy/README.md` with install/run steps
+
 ### Simple Sticker flow
 
 1. Allowed user sends multi-line text to the bot.
@@ -148,6 +181,7 @@ RUST_LOG=info cargo run -p telegram-bot -- --config bot-config.toml
 6. Button becomes `Напечатать ещё раз` for quick reprint.
 7. Bot shows menu buttons (`Помощь`, `История`, `Простой стикер`) as reply keyboard.
 8. User can also send an image; bot resizes to printer width (`384px`), applies threshold/dithering and returns preview.
+9. AI mode: press `🤖 ИИ картинка`, send text prompt, bot requests `ai-service`, then returns print preview.
 
 ### Access control
 
