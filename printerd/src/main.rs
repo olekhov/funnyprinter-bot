@@ -23,6 +23,8 @@ use funnyprint_render::{TextRenderOptions, image_to_packed_lines, px_to_mm, rend
 use image::{DynamicImage, GrayImage, ImageFormat};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, mpsc};
+use tracing::{error, info, warn};
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Debug, Parser)]
 #[command(name = "printerd")]
@@ -128,6 +130,11 @@ struct PrintResponse {
     status_url: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct WaitQuery {
+    timeout_seconds: Option<u64>,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
@@ -141,6 +148,12 @@ struct ScanDevice {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_target(false)
+        .compact()
+        .init();
+
     let args = Args::parse();
     let listen_addr: SocketAddr = args.listen.parse()?;
 
@@ -165,10 +178,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/renders/{id}/preview", get(get_preview))
         .route("/api/v1/print", post(queue_print))
         .route("/api/v1/jobs/{id}", get(get_job))
+        .route("/api/v1/jobs/{id}/wait", get(wait_job))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-    println!("printerd listening on http://{}", listen_addr);
+    info!("printerd listening on http://{}", listen_addr);
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -188,6 +202,7 @@ async fn scan_printers(
     }
 
     let secs = query.seconds.unwrap_or(3).clamp(1, 15);
+    info!(scan_seconds = secs, "starting BLE scan");
     match discover_candidates(Duration::from_secs(secs)).await {
         Ok(list) => {
             let devices: Vec<ScanDevice> = list
@@ -197,9 +212,13 @@ async fn scan_printers(
                     local_name: d.local_name,
                 })
                 .collect();
+            info!(found = devices.len(), "BLE scan completed");
             (StatusCode::OK, axum::Json(devices)).into_response()
         }
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, format!("scan failed: {err}")),
+        Err(err) => {
+            error!(error = %err, "BLE scan failed");
+            error_response(StatusCode::BAD_GATEWAY, format!("scan failed: {err}"))
+        }
     }
 }
 
@@ -283,6 +302,13 @@ async fn render_text(
         .write()
         .await
         .insert(render_id.clone(), artifact);
+    info!(
+        render_id = %render_id,
+        width_px = image.width(),
+        height_px = image.height(),
+        packed_lines = packed.len(),
+        "rendered text preview"
+    );
 
     let resp = RenderTextResponse {
         render_id: render_id.clone(),
@@ -364,6 +390,13 @@ async fn queue_print(
         error: None,
     };
     state.jobs.write().await.insert(job_id.clone(), record);
+    info!(
+        job_id = %job_id,
+        render_id = %req.render_id,
+        address = %address,
+        density = density,
+        "queued print job"
+    );
 
     let cmd = PrintCommand {
         job_id: job_id.clone(),
@@ -387,6 +420,40 @@ async fn queue_print(
     (StatusCode::ACCEPTED, axum::Json(resp)).into_response()
 }
 
+async fn wait_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<WaitQuery>,
+) -> Response {
+    if let Err(resp) = require_auth(&state, &headers) {
+        return resp;
+    }
+
+    let timeout_secs = query.timeout_seconds.unwrap_or(20).clamp(1, 120);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+
+    loop {
+        let maybe_job = { state.jobs.read().await.get(&id).cloned() };
+        let Some(job) = maybe_job else {
+            return error_response(StatusCode::NOT_FOUND, "job not found".to_string());
+        };
+
+        match job.status {
+            JobStatus::Done | JobStatus::Failed => {
+                return (StatusCode::OK, axum::Json(job)).into_response();
+            }
+            JobStatus::Queued | JobStatus::Printing => {}
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return (StatusCode::ACCEPTED, axum::Json(job)).into_response();
+        }
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
 async fn get_job(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -406,6 +473,13 @@ async fn get_job(
 
 async fn worker_loop(state: AppState, mut rx: mpsc::Receiver<PrintCommand>) {
     while let Some(cmd) = rx.recv().await {
+        info!(
+            job_id = %cmd.job_id,
+            render_id = %cmd.render_id,
+            address = %cmd.address,
+            density = cmd.density,
+            "starting print job"
+        );
         {
             let mut jobs = state.jobs.write().await;
             if let Some(job) = jobs.get_mut(&cmd.job_id) {
@@ -430,10 +504,12 @@ async fn worker_loop(state: AppState, mut rx: mpsc::Receiver<PrintCommand>) {
                 Ok(()) => {
                     job.status = JobStatus::Done;
                     job.error = None;
+                    info!(job_id = %cmd.job_id, "print job completed");
                 }
                 Err(err) => {
                     job.status = JobStatus::Failed;
                     job.error = Some(err.to_string());
+                    warn!(job_id = %cmd.job_id, error = %err, "print job failed");
                 }
             }
         }

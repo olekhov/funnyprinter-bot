@@ -5,6 +5,7 @@ sqlite_path = "./printerbot.sqlite3"
 base_url = "http://127.0.0.1:8080"
 api_token = "change-me"
 address = "C0:00:00:00:06:B3"
+wait_job_timeout_seconds = 20
 
 [sticker]
 font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"

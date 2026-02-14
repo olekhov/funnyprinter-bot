@@ -15,3 +15,5 @@ image.workspace = true
 futures.workspace = true
 funnyprint-proto = { path = "../funnyprint-proto" }
 funnyprint-render = { path = "../funnyprint-render" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
