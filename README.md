@@ -10,6 +10,7 @@ Protocol reversed by [ValdikSS](https://github.com/ValdikSS/printer-driver-funny
 - `funnyprint-render`: text-to-image rendering and conversion into printer packed lines.
 - `funnyprint-cli`: CLI for scanning BLE printers and printing text with PNG preview output.
 - `printerd`: HTTP daemon with render cache, preview endpoint and queued print jobs.
+- `telegram-bot`: Telegram UI over `printerd` with confirm-print flow and persistent history in SQLite.
 
 ## Driver-derived printer facts
 
@@ -104,3 +105,38 @@ curl -sS -X POST http://<pi-ip>:8080/api/v1/print \
 ```bash
 curl -sS http://<pi-ip>:8080/api/v1/jobs/j_1
 ```
+
+## Telegram Bot
+
+The bot uses `printerd` as rendering/printing backend and keeps history in SQLite, so previews and reprint buttons survive bot restarts.
+
+### Run
+
+```bash
+cp telegram-bot/bot-config.example.toml bot-config.toml
+$EDITOR bot-config.toml
+cargo run -p telegram-bot -- --config bot-config.toml
+```
+
+### Simple Sticker flow
+
+1. Allowed user sends multi-line text to the bot.
+2. Bot calculates the largest fitting font size for configured margins and width.
+3. Bot requests preview from `printerd`, stores sticker record in SQLite, sends preview image.
+4. User presses `Печатать`.
+5. Bot re-renders by saved parameters and sends print request.
+6. Button becomes `Напечатать ещё раз` for quick reprint.
+
+### Access control
+
+Only users from `allowed_users` SQLite table can use the bot.
+
+- Initial seeding is done from `access.allowed_user_ids` in config.
+- To add/remove manually on Raspberry Pi:
+
+```bash
+sqlite3 printerbot.sqlite3 "INSERT OR IGNORE INTO allowed_users (user_id, note) VALUES (123456789, 'manual');"
+sqlite3 printerbot.sqlite3 "DELETE FROM allowed_users WHERE user_id = 123456789;"
+```
+
+To get your Telegram user id, send `/start` to `@userinfobot` (or similar bot), then add that id.
