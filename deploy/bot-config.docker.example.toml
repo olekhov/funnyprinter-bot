@@ -1,15 +1,15 @@
 telegram_token = "123456:replace_me"
-sqlite_path = "./printerbot.sqlite3"
+sqlite_path = "/app/data/printerbot.sqlite3"
 
 [printerd]
-base_url = "http://127.0.0.1:8080"
+base_url = "http://host.docker.internal:8080"
 api_token = "change-me"
 address = "C0:00:00:00:06:B3"
 wait_job_timeout_seconds = 20
 
 [ai_service]
-base_url = "http://127.0.0.1:8090"
-api_token = "change-me"
+base_url = "http://ai-service:8090"
+api_token = ""
 default_size = "1024x1024"
 default_quality = "low"
 
@@ -30,10 +30,10 @@ trim_blank_top_bottom = true
 
 [image_sticker]
 threshold = 170
-dither_method = "floyd_steinberg" # threshold | floyd_steinberg
+dither_method = "floyd_steinberg"
 density = 3
 invert = false
 trim_blank_top_bottom = false
 
 [access]
-allowed_user_ids = [123456789, 987654321]
+allowed_user_ids = [123456789]

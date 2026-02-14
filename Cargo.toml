@@ -5,6 +5,7 @@ members = [
   "funnyprint-cli",
   "printerd",
   "telegram-bot",
+  "ai-service",
 ]
 resolver = "2"
 

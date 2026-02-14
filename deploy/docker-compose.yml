@@ -1,0 +1,38 @@
+x-app-image: &app_image
+  build:
+    context: ..
+    dockerfile: deploy/docker/Dockerfile.app
+  image: printerbot/app:latest
+
+services:
+  ai-service:
+    <<: *app_image
+    container_name: printerbot-ai-service
+    restart: unless-stopped
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    command: ["/usr/local/bin/ai-service", "--listen", "0.0.0.0:8090", "--model", "gpt-image-1.5"]
+    networks:
+      - printerbot
+
+  telegram-bot:
+    image: printerbot/app:latest
+    container_name: printerbot-telegram-bot
+    restart: unless-stopped
+    depends_on:
+      - ai-service
+    environment:
+      RUST_LOG: debug
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["/usr/local/bin/telegram-bot", "--config", "/app/bot-config.toml"]
+    volumes:
+      - ./bot-config.toml:/app/bot-config.toml:ro
+      - ./data:/app/data
+    networks:
+      - printerbot
+
+networks:
+  printerbot:
+    name: printerbot
