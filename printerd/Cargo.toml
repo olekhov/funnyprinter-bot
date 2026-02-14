@@ -1,0 +1,17 @@
+[package]
+name = "printerd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+clap.workspace = true
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image.workspace = true
+futures.workspace = true
+funnyprint-proto = { path = "../funnyprint-proto" }
+funnyprint-render = { path = "../funnyprint-render" }

@@ -1,0 +1,475 @@
+use std::{
+    collections::HashMap,
+    io::Cursor,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+use axum::{
+    Router,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use clap::Parser;
+use funnyprint_proto::{MAX_DOTS_PER_LINE, PackedLine, discover_candidates, dpi, print_job};
+use funnyprint_render::{TextRenderOptions, image_to_packed_lines, px_to_mm, render_text_to_image};
+use image::{DynamicImage, GrayImage, ImageFormat};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{RwLock, mpsc};
+
+#[derive(Debug, Parser)]
+#[command(name = "printerd")]
+#[command(about = "HTTP print daemon for FunnyPrint BLE printers")]
+struct Args {
+    #[arg(long, default_value = "0.0.0.0:8080")]
+    listen: String,
+    #[arg(long)]
+    default_address: Option<String>,
+    #[arg(long)]
+    api_token: Option<String>,
+}
+
+#[derive(Clone)]
+struct AppState {
+    api_token: Option<String>,
+    default_address: Option<String>,
+    renders: Arc<RwLock<HashMap<String, RenderArtifact>>>,
+    jobs: Arc<RwLock<HashMap<String, JobRecord>>>,
+    render_seq: Arc<AtomicU64>,
+    job_seq: Arc<AtomicU64>,
+    queue_tx: mpsc::Sender<PrintCommand>,
+}
+
+#[derive(Clone)]
+struct RenderArtifact {
+    preview_png: Vec<u8>,
+    packed_lines: Vec<PackedLine>,
+    density: u8,
+    address_override: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum JobStatus {
+    Queued,
+    Printing,
+    Done,
+    Failed,
+}
+
+#[derive(Clone, Serialize)]
+struct JobRecord {
+    id: String,
+    render_id: String,
+    address: String,
+    density: u8,
+    status: JobStatus,
+    error: Option<String>,
+}
+
+#[derive(Debug)]
+struct PrintCommand {
+    job_id: String,
+    render_id: String,
+    address: String,
+    density: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScanQuery {
+    seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RenderTextRequest {
+    text: String,
+    font_path: String,
+    width_px: Option<u32>,
+    height_px: Option<u32>,
+    x_px: Option<i32>,
+    y_px: Option<i32>,
+    font_size_px: Option<f32>,
+    threshold: Option<u8>,
+    invert: Option<bool>,
+    trim_blank_top_bottom: Option<bool>,
+    density: Option<u8>,
+    address: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RenderTextResponse {
+    render_id: String,
+    width_px: u32,
+    height_px: u32,
+    width_mm: f32,
+    height_mm: f32,
+    packed_lines: usize,
+    preview_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrintRequest {
+    render_id: String,
+    address: Option<String>,
+    density: Option<u8>,
+}
+
+#[derive(Debug, Serialize)]
+struct PrintResponse {
+    job_id: String,
+    status_url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorBody {
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ScanDevice {
+    address: String,
+    local_name: Option<String>,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let listen_addr: SocketAddr = args.listen.parse()?;
+
+    let (tx, rx) = mpsc::channel::<PrintCommand>(64);
+
+    let state = AppState {
+        api_token: args.api_token,
+        default_address: args.default_address,
+        renders: Arc::new(RwLock::new(HashMap::new())),
+        jobs: Arc::new(RwLock::new(HashMap::new())),
+        render_seq: Arc::new(AtomicU64::new(1)),
+        job_seq: Arc::new(AtomicU64::new(1)),
+        queue_tx: tx,
+    };
+
+    tokio::spawn(worker_loop(state.clone(), rx));
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/api/v1/printers/scan", get(scan_printers))
+        .route("/api/v1/renders/text", post(render_text))
+        .route("/api/v1/renders/{id}/preview", get(get_preview))
+        .route("/api/v1/print", post(queue_print))
+        .route("/api/v1/jobs/{id}", get(get_job))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    println!("printerd listening on http://{}", listen_addr);
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+async fn health() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
+}
+
+async fn scan_printers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ScanQuery>,
+) -> Response {
+    if let Err(resp) = require_auth(&state, &headers) {
+        return resp;
+    }
+
+    let secs = query.seconds.unwrap_or(3).clamp(1, 15);
+    match discover_candidates(Duration::from_secs(secs)).await {
+        Ok(list) => {
+            let devices: Vec<ScanDevice> = list
+                .into_iter()
+                .map(|d| ScanDevice {
+                    address: d.address,
+                    local_name: d.local_name,
+                })
+                .collect();
+            (StatusCode::OK, axum::Json(devices)).into_response()
+        }
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, format!("scan failed: {err}")),
+    }
+}
+
+async fn render_text(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<RenderTextRequest>,
+) -> Response {
+    if let Err(resp) = require_auth(&state, &headers) {
+        return resp;
+    }
+
+    if req.text.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "text is empty".to_string());
+    }
+
+    let width_px = req.width_px.unwrap_or(MAX_DOTS_PER_LINE as u32);
+    if width_px as usize > MAX_DOTS_PER_LINE {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("width_px exceeds max {}", MAX_DOTS_PER_LINE),
+        );
+    }
+
+    let opts = TextRenderOptions {
+        width_px,
+        height_px: req.height_px.unwrap_or(192),
+        x_px: req.x_px.unwrap_or(0),
+        y_px: req.y_px.unwrap_or(0),
+        font_size_px: req.font_size_px.unwrap_or(48.0),
+        threshold: req.threshold.unwrap_or(180),
+        invert: req.invert.unwrap_or(false),
+        trim_blank_top_bottom: req.trim_blank_top_bottom.unwrap_or(true),
+    };
+
+    let font_path = PathBuf::from(req.font_path);
+    let image = match render_text_to_image(&req.text, &font_path, &opts) {
+        Ok(v) => v,
+        Err(err) => {
+            return error_response(StatusCode::BAD_REQUEST, format!("render failed: {err}"));
+        }
+    };
+
+    let packed = image_to_packed_lines(&image, opts.threshold, opts.trim_blank_top_bottom);
+    if packed.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "render result is blank after trim".to_string(),
+        );
+    }
+
+    let png = match encode_png(&image) {
+        Ok(v) => v,
+        Err(err) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("png encode failed: {err}"),
+            );
+        }
+    };
+
+    let density = req.density.unwrap_or(3);
+    if density > 7 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "density must be in 0..=7".to_string(),
+        );
+    }
+
+    let render_id = next_id("r", &state.render_seq);
+    let artifact = RenderArtifact {
+        preview_png: png,
+        packed_lines: packed.clone(),
+        density,
+        address_override: req.address,
+    };
+
+    state
+        .renders
+        .write()
+        .await
+        .insert(render_id.clone(), artifact);
+
+    let resp = RenderTextResponse {
+        render_id: render_id.clone(),
+        width_px: image.width(),
+        height_px: image.height(),
+        width_mm: px_to_mm(image.width(), dpi()),
+        height_mm: px_to_mm(image.height(), dpi()),
+        packed_lines: packed.len(),
+        preview_url: format!("/api/v1/renders/{render_id}/preview"),
+    };
+
+    (StatusCode::OK, axum::Json(resp)).into_response()
+}
+
+async fn get_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(resp) = require_auth(&state, &headers) {
+        return resp;
+    }
+
+    let renders = state.renders.read().await;
+    let Some(artifact) = renders.get(&id) else {
+        return error_response(StatusCode::NOT_FOUND, "render not found".to_string());
+    };
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "image/png")],
+        artifact.preview_png.clone(),
+    )
+        .into_response()
+}
+
+async fn queue_print(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<PrintRequest>,
+) -> Response {
+    if let Err(resp) = require_auth(&state, &headers) {
+        return resp;
+    }
+
+    let Some(artifact) = state.renders.read().await.get(&req.render_id).cloned() else {
+        return error_response(StatusCode::NOT_FOUND, "render not found".to_string());
+    };
+
+    let address = match req
+        .address
+        .or(artifact.address_override)
+        .or_else(|| state.default_address.clone())
+    {
+        Some(v) => v,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "address is missing and no --default-address configured".to_string(),
+            );
+        }
+    };
+
+    let density = req.density.unwrap_or(artifact.density);
+    if density > 7 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "density must be in 0..=7".to_string(),
+        );
+    }
+
+    let job_id = next_id("j", &state.job_seq);
+    let record = JobRecord {
+        id: job_id.clone(),
+        render_id: req.render_id.clone(),
+        address: address.clone(),
+        density,
+        status: JobStatus::Queued,
+        error: None,
+    };
+    state.jobs.write().await.insert(job_id.clone(), record);
+
+    let cmd = PrintCommand {
+        job_id: job_id.clone(),
+        render_id: req.render_id,
+        address,
+        density,
+    };
+
+    if state.queue_tx.send(cmd).await.is_err() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "print queue is not available".to_string(),
+        );
+    }
+
+    let resp = PrintResponse {
+        job_id: job_id.clone(),
+        status_url: format!("/api/v1/jobs/{job_id}"),
+    };
+
+    (StatusCode::ACCEPTED, axum::Json(resp)).into_response()
+}
+
+async fn get_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(resp) = require_auth(&state, &headers) {
+        return resp;
+    }
+
+    let jobs = state.jobs.read().await;
+    let Some(job) = jobs.get(&id) else {
+        return error_response(StatusCode::NOT_FOUND, "job not found".to_string());
+    };
+
+    (StatusCode::OK, axum::Json(job)).into_response()
+}
+
+async fn worker_loop(state: AppState, mut rx: mpsc::Receiver<PrintCommand>) {
+    while let Some(cmd) = rx.recv().await {
+        {
+            let mut jobs = state.jobs.write().await;
+            if let Some(job) = jobs.get_mut(&cmd.job_id) {
+                job.status = JobStatus::Printing;
+                job.error = None;
+            }
+        }
+
+        let packed = {
+            let renders = state.renders.read().await;
+            renders.get(&cmd.render_id).map(|r| r.packed_lines.clone())
+        };
+
+        let result = match packed {
+            Some(lines) => print_job(&cmd.address, &lines, cmd.density).await,
+            None => Err(anyhow::anyhow!("render {} not found", cmd.render_id)),
+        };
+
+        let mut jobs = state.jobs.write().await;
+        if let Some(job) = jobs.get_mut(&cmd.job_id) {
+            match result {
+                Ok(()) => {
+                    job.status = JobStatus::Done;
+                    job.error = None;
+                }
+                Err(err) => {
+                    job.status = JobStatus::Failed;
+                    job.error = Some(err.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn encode_png(image: &GrayImage) -> anyhow::Result<Vec<u8>> {
+    let dyn_img = DynamicImage::ImageLuma8(image.clone());
+    let mut cursor = Cursor::new(Vec::<u8>::new());
+    dyn_img.write_to(&mut cursor, ImageFormat::Png)?;
+    Ok(cursor.into_inner())
+}
+
+fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    let Some(expected) = &state.api_token else {
+        return Ok(());
+    };
+
+    let got = headers
+        .get("x-api-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+
+    if got == expected {
+        Ok(())
+    } else {
+        Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized".to_string(),
+        ))
+    }
+}
+
+fn error_response(status: StatusCode, message: String) -> Response {
+    (status, axum::Json(ErrorBody { error: message })).into_response()
+}
+
+fn next_id(prefix: &str, seq: &AtomicU64) -> String {
+    let n = seq.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}_{n}")
+}

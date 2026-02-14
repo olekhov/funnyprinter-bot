@@ -2,15 +2,18 @@
 
 Rust workspace for direct BLE printing to FunnyPrint-compatible printers (Xiqi/DOLEWA class), without CUPS.
 
+Protocol reversed by [ValdikSS](https://github.com/ValdikSS/printer-driver-funnyprint/tree/master).
+
 ## Crates
 
 - `funnyprint-proto`: BLE protocol and printer interaction logic ported from `printer-driver-funnyprint` Python driver.
 - `funnyprint-render`: text-to-image rendering and conversion into printer packed lines.
 - `funnyprint-cli`: CLI for scanning BLE printers and printing text with PNG preview output.
+- `printerd`: HTTP daemon with render cache, preview endpoint and queued print jobs.
 
 ## Driver-derived printer facts
 
-From `../printer-driver-funnyprint/xiqi.drv` and Python code:
+From `printer-driver-funnyprint/xiqi.drv` and ValdikSS's Python code:
 
 - Resolution: `203 dpi`
 - Max print width in protocol packets: `384 dots` (48 bytes per raster row)
@@ -48,4 +51,56 @@ cargo run -p funnyprint-cli -- print-text \
   --text "Preview" \
   --font /path/to/font.ttf \
   --preview-only
+```
+
+## printerd (LAN-ready HTTP daemon)
+
+Start daemon (bind all interfaces):
+
+```bash
+cargo run -p printerd -- \
+  --listen 0.0.0.0:8080 \
+  --default-address C0:00:00:00:06:B3
+```
+
+Optional auth token:
+
+```bash
+cargo run -p printerd -- \
+  --listen 0.0.0.0:8080 \
+  --default-address C0:00:00:00:06:B3 \
+  --api-token change-me
+```
+When token is set, include `-H 'x-api-token: change-me'` in all `/api/v1/*` requests.
+
+Main flow:
+
+1. Render text and get `render_id`:
+```bash
+curl -sS -X POST http://<pi-ip>:8080/api/v1/renders/text \
+  -H 'content-type: application/json' \
+  -d '{
+    "text":"Hello sticker",
+    "font_path":"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "font_size_px":48,
+    "x_px":8,
+    "y_px":16
+  }'
+```
+
+2. Show preview:
+```bash
+curl -sS http://<pi-ip>:8080/api/v1/renders/r_1/preview > preview.png
+```
+
+3. Queue print:
+```bash
+curl -sS -X POST http://<pi-ip>:8080/api/v1/print \
+  -H 'content-type: application/json' \
+  -d '{"render_id":"r_1"}'
+```
+
+4. Check job status:
+```bash
+curl -sS http://<pi-ip>:8080/api/v1/jobs/j_1
 ```

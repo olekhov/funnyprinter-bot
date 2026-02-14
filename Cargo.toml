@@ -3,6 +3,7 @@ members = [
   "funnyprint-proto",
   "funnyprint-render",
   "funnyprint-cli",
+  "printerd",
 ]
 resolver = "2"
 
