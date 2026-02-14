@@ -22,5 +22,12 @@ density = 3
 invert = false
 trim_blank_top_bottom = true
 
+[image_sticker]
+threshold = 170
+dither_method = "floyd_steinberg" # threshold | floyd_steinberg
+density = 3
+invert = false
+trim_blank_top_bottom = false
+
 [access]
 allowed_user_ids = [123456789, 987654321]

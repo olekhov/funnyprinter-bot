@@ -93,6 +93,13 @@ curl -sS -X POST http://<pi-ip>:8080/api/v1/renders/text \
   }'
 ```
 
+Image render (base64 payload):
+```bash
+curl -sS -X POST http://<pi-ip>:8080/api/v1/renders/image \
+  -H 'content-type: application/json' \
+  -d '{"image_base64":"<BASE64>", "width_px":384, "dither_method":"floyd_steinberg", "threshold":170}'
+```
+
 2. Show preview:
 ```bash
 curl -sS http://<pi-ip>:8080/api/v1/renders/r_1/preview > preview.png
@@ -140,6 +147,7 @@ RUST_LOG=info cargo run -p telegram-bot -- --config bot-config.toml
 5. Bot re-renders by saved parameters and sends print request.
 6. Button becomes `Напечатать ещё раз` for quick reprint.
 7. Bot shows menu buttons (`Помощь`, `История`, `Простой стикер`) as reply keyboard.
+8. User can also send an image; bot resizes to printer width (`384px`), applies threshold/dithering and returns preview.
 
 ### Access control
 

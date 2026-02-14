@@ -17,10 +17,11 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::Engine;
 use clap::Parser;
 use funnyprint_proto::{MAX_DOTS_PER_LINE, PackedLine, discover_candidates, dpi, print_job};
 use funnyprint_render::{TextRenderOptions, image_to_packed_lines, px_to_mm, render_text_to_image};
-use image::{DynamicImage, GrayImage, ImageFormat};
+use image::{DynamicImage, GrayImage, ImageFormat, Luma, imageops::FilterType};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{error, info, warn};
@@ -106,6 +107,26 @@ struct RenderTextRequest {
     address: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum DitherMethod {
+    Threshold,
+    FloydSteinberg,
+}
+
+#[derive(Debug, Deserialize)]
+struct RenderImageRequest {
+    image_base64: String,
+    width_px: Option<u32>,
+    max_height_px: Option<u32>,
+    threshold: Option<u8>,
+    dither_method: Option<DitherMethod>,
+    invert: Option<bool>,
+    trim_blank_top_bottom: Option<bool>,
+    density: Option<u8>,
+    address: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct RenderTextResponse {
     render_id: String,
@@ -175,6 +196,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/api/v1/printers/scan", get(scan_printers))
         .route("/api/v1/renders/text", post(render_text))
+        .route("/api/v1/renders/image", post(render_image))
         .route("/api/v1/renders/{id}/preview", get(get_preview))
         .route("/api/v1/print", post(queue_print))
         .route("/api/v1/jobs/{id}", get(get_job))
@@ -317,6 +339,119 @@ async fn render_text(
         width_mm: px_to_mm(image.width(), dpi()),
         height_mm: px_to_mm(image.height(), dpi()),
         packed_lines: packed.len(),
+        preview_url: format!("/api/v1/renders/{render_id}/preview"),
+    };
+
+    (StatusCode::OK, axum::Json(resp)).into_response()
+}
+
+async fn render_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<RenderImageRequest>,
+) -> Response {
+    if let Err(resp) = require_auth(&state, &headers) {
+        return resp;
+    }
+
+    let width_px = req.width_px.unwrap_or(MAX_DOTS_PER_LINE as u32);
+    if width_px == 0 || width_px as usize > MAX_DOTS_PER_LINE {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("width_px must be in 1..={}", MAX_DOTS_PER_LINE),
+        );
+    }
+
+    let image_bytes = match base64::engine::general_purpose::STANDARD.decode(req.image_base64) {
+        Ok(v) => v,
+        Err(err) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("invalid image_base64: {err}"),
+            );
+        }
+    };
+
+    let dyn_img = match image::load_from_memory(&image_bytes) {
+        Ok(v) => v,
+        Err(err) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("invalid image data: {err}"),
+            );
+        }
+    };
+
+    let gray = dyn_img.to_luma8();
+    let src_w = gray.width().max(1);
+    let src_h = gray.height().max(1);
+    let mut target_h = ((src_h as f32 * width_px as f32) / src_w as f32).round() as u32;
+    target_h = target_h.max(1);
+    if let Some(max_h) = req.max_height_px {
+        target_h = target_h.min(max_h.max(1));
+    }
+
+    let resized = image::imageops::resize(&gray, width_px, target_h, FilterType::Lanczos3);
+    let threshold = req.threshold.unwrap_or(180);
+    let dither = req.dither_method.unwrap_or(DitherMethod::FloydSteinberg);
+    let invert = req.invert.unwrap_or(false);
+    let trim_blank = req.trim_blank_top_bottom.unwrap_or(true);
+
+    let bw_preview = binarize_preview(&resized, threshold, dither, invert);
+    let packed_lines = pack_bw_image(&bw_preview, trim_blank);
+    if packed_lines.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "render result is blank after trim".to_string(),
+        );
+    }
+
+    let preview_png = match encode_png(&bw_preview) {
+        Ok(v) => v,
+        Err(err) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("png encode failed: {err}"),
+            );
+        }
+    };
+
+    let density = req.density.unwrap_or(3);
+    if density > 7 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "density must be in 0..=7".to_string(),
+        );
+    }
+
+    let render_id = next_id("r", &state.render_seq);
+    let artifact = RenderArtifact {
+        preview_png,
+        packed_lines: packed_lines.clone(),
+        density,
+        address_override: req.address,
+    };
+    state
+        .renders
+        .write()
+        .await
+        .insert(render_id.clone(), artifact);
+
+    info!(
+        render_id = %render_id,
+        width_px = bw_preview.width(),
+        height_px = bw_preview.height(),
+        packed_lines = packed_lines.len(),
+        "rendered image preview"
+    );
+
+    let resp = RenderTextResponse {
+        render_id: render_id.clone(),
+        width_px: bw_preview.width(),
+        height_px: bw_preview.height(),
+        width_mm: px_to_mm(bw_preview.width(), dpi()),
+        height_mm: px_to_mm(bw_preview.height(), dpi()),
+        packed_lines: packed_lines.len(),
         preview_url: format!("/api/v1/renders/{render_id}/preview"),
     };
 
@@ -521,6 +656,107 @@ fn encode_png(image: &GrayImage) -> anyhow::Result<Vec<u8>> {
     let mut cursor = Cursor::new(Vec::<u8>::new());
     dyn_img.write_to(&mut cursor, ImageFormat::Png)?;
     Ok(cursor.into_inner())
+}
+
+fn binarize_preview(
+    gray: &GrayImage,
+    threshold: u8,
+    method: DitherMethod,
+    invert: bool,
+) -> GrayImage {
+    match method {
+        DitherMethod::Threshold => threshold_binarize(gray, threshold, invert),
+        DitherMethod::FloydSteinberg => floyd_steinberg_binarize(gray, threshold, invert),
+    }
+}
+
+fn threshold_binarize(gray: &GrayImage, threshold: u8, invert: bool) -> GrayImage {
+    let mut out = GrayImage::new(gray.width(), gray.height());
+    for (x, y, p) in gray.enumerate_pixels() {
+        let mut v = p.0[0];
+        if invert {
+            v = 255 - v;
+        }
+        let bw = if v <= threshold { 0u8 } else { 255u8 };
+        out.put_pixel(x, y, Luma([bw]));
+    }
+    out
+}
+
+fn floyd_steinberg_binarize(gray: &GrayImage, threshold: u8, invert: bool) -> GrayImage {
+    let w = gray.width() as usize;
+    let h = gray.height() as usize;
+    let mut buf = vec![0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut v = gray.get_pixel(x as u32, y as u32).0[0] as f32;
+            if invert {
+                v = 255.0 - v;
+            }
+            buf[y * w + x] = v;
+        }
+    }
+
+    let mut out = GrayImage::new(gray.width(), gray.height());
+    for y in 0..h {
+        for x in 0..w {
+            let idx = y * w + x;
+            let old = buf[idx].clamp(0.0, 255.0);
+            let new = if old <= threshold as f32 { 0.0 } else { 255.0 };
+            let err = old - new;
+            out.put_pixel(x as u32, y as u32, Luma([new as u8]));
+
+            if x + 1 < w {
+                buf[idx + 1] += err * 7.0 / 16.0;
+            }
+            if y + 1 < h {
+                if x > 0 {
+                    buf[idx + w - 1] += err * 3.0 / 16.0;
+                }
+                buf[idx + w] += err * 5.0 / 16.0;
+                if x + 1 < w {
+                    buf[idx + w + 1] += err * 1.0 / 16.0;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn pack_bw_image(img: &GrayImage, trim_blank: bool) -> Vec<PackedLine> {
+    let width = img.width().min(MAX_DOTS_PER_LINE as u32) as usize;
+    let height = img.height() as usize;
+    let bytes_per_line = MAX_DOTS_PER_LINE / 8;
+    let mut out = Vec::with_capacity(height.div_ceil(2));
+
+    for y in (0..height).step_by(2) {
+        let mut line = [0u8; 96];
+        for row in 0..2 {
+            let yy = y + row;
+            if yy >= height {
+                continue;
+            }
+            for x in 0..width {
+                let px = img.get_pixel(x as u32, yy as u32).0[0];
+                if px == 0 {
+                    let byte_idx = row * bytes_per_line + (x / 8);
+                    let bit = 7 - (x % 8);
+                    line[byte_idx] |= 1u8 << bit;
+                }
+            }
+        }
+        out.push(line);
+    }
+
+    if !trim_blank {
+        return out;
+    }
+    let first = out.iter().position(|l| l.iter().any(|b| *b != 0));
+    let last = out.iter().rposition(|l| l.iter().any(|b| *b != 0));
+    match (first, last) {
+        (Some(start), Some(end)) => out[start..=end].to_vec(),
+        _ => Vec::new(),
+    }
 }
 
 fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {

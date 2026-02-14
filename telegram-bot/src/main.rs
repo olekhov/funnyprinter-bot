@@ -2,6 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use teloxide::{
@@ -29,6 +30,7 @@ struct Config {
     sqlite_path: String,
     printerd: PrinterdConfig,
     sticker: StickerConfig,
+    image_sticker: ImageStickerConfig,
     access: AccessConfig,
 }
 
@@ -55,6 +57,22 @@ struct StickerConfig {
     density: u8,
     invert: bool,
     trim_blank_top_bottom: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ImageStickerConfig {
+    threshold: u8,
+    dither_method: DitherMethod,
+    density: u8,
+    invert: bool,
+    trim_blank_top_bottom: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DitherMethod {
+    Threshold,
+    FloydSteinberg,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -86,6 +104,7 @@ struct PrinterdClient {
 #[derive(Debug, Clone)]
 struct StickerRecord {
     id: i64,
+    kind: StickerKind,
     text: String,
     width_px: u32,
     height_px: u32,
@@ -96,8 +115,16 @@ struct StickerRecord {
     invert: bool,
     trim_blank_top_bottom: bool,
     density: u8,
+    dither_method: Option<DitherMethod>,
+    source_image_bytes: Option<Vec<u8>>,
     preview_png: Vec<u8>,
     created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StickerKind {
+    Text,
+    Image,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,7 +147,22 @@ struct RenderTextRequest {
 #[derive(Debug, Deserialize)]
 struct RenderTextResponse {
     render_id: String,
+    width_px: u32,
+    height_px: u32,
     preview_url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RenderImageRequest {
+    image_base64: String,
+    width_px: u32,
+    max_height_px: Option<u32>,
+    threshold: u8,
+    dither_method: DitherMethod,
+    invert: bool,
+    trim_blank_top_bottom: bool,
+    density: u8,
+    address: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -176,6 +218,9 @@ async fn main() -> Result<()> {
     if cfg.sticker.density > 7 {
         bail!("sticker.density must be in 0..=7");
     }
+    if cfg.image_sticker.density > 7 {
+        bail!("image_sticker.density must be in 0..=7");
+    }
     if cfg.sticker.printer_width_px == 0 {
         bail!("sticker.printer_width_px must be > 0");
     }
@@ -230,49 +275,74 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
         return Ok(());
     }
 
-    let Some(text) = msg.text() else {
-        return Ok(());
-    };
-
-    if let Some(cmd) = map_menu_button_to_command(text) {
-        handle_command(&bot, &msg, &state, user_id, cmd).await?;
-        return Ok(());
-    }
-
-    if let Ok(cmd) = Command::parse(text, "bot") {
-        handle_command(&bot, &msg, &state, user_id, cmd).await?;
-        return Ok(());
-    }
-
-    if text.starts_with('/') {
-        bot.send_message(msg.chat.id, "Неизвестная команда. /help")
-            .await?;
-        return Ok(());
-    }
-
-    match create_simple_sticker(&state, user_id, msg.chat.id.0, text).await {
-        Ok(record) => {
-            info!(
-                user_id = user_id,
-                sticker_id = record.id,
-                "created sticker preview"
-            );
-            let caption = format!(
-                "Превью стикера.\nШрифт: {:.1}px\nНажмите кнопку для печати.",
-                record.font_size_px
-            );
-            bot.send_photo(
-                msg.chat.id,
-                InputFile::memory(record.preview_png.clone()).file_name("preview.png"),
-            )
-            .caption(caption)
-            .reply_markup(print_keyboard(record.id))
-            .await?;
+    if let Some(text) = msg.text() {
+        if let Some(cmd) = map_menu_button_to_command(text) {
+            handle_command(&bot, &msg, &state, user_id, cmd).await?;
+            return Ok(());
         }
-        Err(err) => {
-            error!(user_id = user_id, error = %err, "failed to create sticker preview");
-            bot.send_message(msg.chat.id, format!("Ошибка рендера: {err}"))
+
+        if let Ok(cmd) = Command::parse(text, "bot") {
+            handle_command(&bot, &msg, &state, user_id, cmd).await?;
+            return Ok(());
+        }
+
+        if text.starts_with('/') {
+            bot.send_message(msg.chat.id, "Неизвестная команда. /help")
                 .await?;
+            return Ok(());
+        }
+
+        match create_simple_sticker(&state, user_id, msg.chat.id.0, text).await {
+            Ok(record) => {
+                info!(
+                    user_id = user_id,
+                    sticker_id = record.id,
+                    "created text sticker preview"
+                );
+                let caption = format!(
+                    "Превью стикера.\nШрифт: {:.1}px\nНажмите кнопку для печати.",
+                    record.font_size_px
+                );
+                bot.send_photo(
+                    msg.chat.id,
+                    InputFile::memory(record.preview_png.clone()).file_name("preview.png"),
+                )
+                .caption(caption)
+                .reply_markup(print_keyboard(record.id))
+                .await?;
+            }
+            Err(err) => {
+                error!(user_id = user_id, error = %err, "failed to create text sticker preview");
+                bot.send_message(msg.chat.id, format!("Ошибка рендера: {err}"))
+                    .await?;
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(photos) = msg.photo() {
+        if let Some(photo) = photos.last() {
+            match create_image_sticker(&bot, &state, user_id, msg.chat.id.0, photo).await {
+                Ok(record) => {
+                    info!(
+                        user_id = user_id,
+                        sticker_id = record.id,
+                        "created image sticker preview"
+                    );
+                    bot.send_photo(
+                        msg.chat.id,
+                        InputFile::memory(record.preview_png.clone()).file_name("preview.png"),
+                    )
+                    .caption("Превью изображения для печати.\nНажмите кнопку для печати.")
+                    .reply_markup(print_keyboard(record.id))
+                    .await?;
+                }
+                Err(err) => {
+                    error!(user_id = user_id, error = %err, "failed to create image sticker preview");
+                    bot.send_message(msg.chat.id, format!("Ошибка обработки изображения: {err}"))
+                        .await?;
+                }
+            }
         }
     }
 
@@ -290,7 +360,7 @@ async fn handle_command(
         Command::Help | Command::Start => {
             bot.send_message(
                 msg.chat.id,
-                "Отправьте текст (поддерживаются переносы строк) и бот пришлёт превью.\nПосле подтверждения стикер будет отправлен на печать.",
+                "Отправьте текст (поддерживаются переносы строк) ИЛИ изображение.\nБот пришлёт превью, после подтверждения стикер будет отправлен на печать.",
             )
             .reply_markup(main_menu_keyboard())
             .await?;
@@ -311,7 +381,11 @@ async fn handle_command(
             }
             Ok(items) => {
                 for item in items {
-                    let caption = format!("{}\n{}", item.created_at, item.text);
+                    let title = match item.kind {
+                        StickerKind::Text => item.text.clone(),
+                        StickerKind::Image => "Изображение".to_string(),
+                    };
+                    let caption = format!("{}\n{}", item.created_at, title);
                     bot.send_photo(
                         msg.chat.id,
                         InputFile::memory(item.preview_png.clone()).file_name("preview.png"),
@@ -483,6 +557,7 @@ async fn create_simple_sticker(
         .insert_sticker(NewSticker {
             user_id,
             chat_id,
+            kind: StickerKind::Text,
             text: text.to_string(),
             width_px: req.width_px,
             height_px: req.height_px,
@@ -493,12 +568,15 @@ async fn create_simple_sticker(
             invert: req.invert,
             trim_blank_top_bottom: req.trim_blank_top_bottom,
             density: req.density,
+            dither_method: None,
+            source_image_bytes: None,
             preview_png: preview_png.clone(),
         })
         .await?;
 
     Ok(StickerRecord {
         id,
+        kind: StickerKind::Text,
         text: text.to_string(),
         width_px: req.width_px,
         height_px: req.height_px,
@@ -509,6 +587,89 @@ async fn create_simple_sticker(
         invert: req.invert,
         trim_blank_top_bottom: req.trim_blank_top_bottom,
         density: req.density,
+        dither_method: None,
+        source_image_bytes: None,
+        preview_png,
+        created_at: "now".to_string(),
+    })
+}
+
+async fn create_image_sticker(
+    bot: &Bot,
+    state: &AppState,
+    user_id: i64,
+    chat_id: i64,
+    photo: &teloxide::types::PhotoSize,
+) -> Result<StickerRecord> {
+    let file = bot
+        .get_file(photo.file.id.clone())
+        .await
+        .context("failed to get telegram file metadata")?;
+    let file_url = format!(
+        "https://api.telegram.org/file/bot{}/{}",
+        state.cfg.telegram_token, file.path
+    );
+    let bytes = reqwest::get(file_url)
+        .await
+        .context("failed to download telegram image")?
+        .bytes()
+        .await
+        .context("failed to read telegram image body")?;
+    let source = bytes.to_vec();
+
+    let image_cfg = &state.cfg.image_sticker;
+    let req = RenderImageRequest {
+        image_base64: base64::engine::general_purpose::STANDARD.encode(&source),
+        width_px: state.cfg.sticker.printer_width_px,
+        max_height_px: None,
+        threshold: image_cfg.threshold,
+        dither_method: image_cfg.dither_method,
+        invert: image_cfg.invert,
+        trim_blank_top_bottom: image_cfg.trim_blank_top_bottom,
+        density: image_cfg.density,
+        address: state.cfg.printerd.address.clone(),
+    };
+
+    let render = state.printerd.render_image(&req).await?;
+    let preview_png = state.printerd.get_preview(&render.preview_url).await?;
+
+    let id = state
+        .db
+        .insert_sticker(NewSticker {
+            user_id,
+            chat_id,
+            kind: StickerKind::Image,
+            text: "Изображение".to_string(),
+            width_px: render.width_px,
+            height_px: render.height_px,
+            x_px: 0,
+            y_px: 0,
+            font_size_px: 0.0,
+            threshold: req.threshold,
+            invert: req.invert,
+            trim_blank_top_bottom: req.trim_blank_top_bottom,
+            density: req.density,
+            dither_method: Some(req.dither_method),
+            source_image_bytes: Some(source.clone()),
+            preview_png: preview_png.clone(),
+        })
+        .await?;
+
+    Ok(StickerRecord {
+        id,
+        kind: StickerKind::Image,
+        text: "Изображение".to_string(),
+        width_px: render.width_px,
+        height_px: render.height_px,
+        x_px: 0,
+        y_px: 0,
+        font_size_px: 0.0,
+        threshold: req.threshold,
+        invert: req.invert,
+        trim_blank_top_bottom: req.trim_blank_top_bottom,
+        density: req.density,
+        dither_method: Some(req.dither_method),
+        source_image_bytes: Some(source),
         preview_png,
         created_at: "now".to_string(),
     })
@@ -519,28 +680,51 @@ async fn process_print_action(state: &AppState, user_id: i64, sticker_id: i64) -
         bail!("стикер не найден");
     };
 
-    let req = RenderTextRequest {
-        text: sticker.text.clone(),
-        font_path: state.cfg.sticker.font_path.clone(),
-        width_px: sticker.width_px,
-        height_px: sticker.height_px,
-        x_px: sticker.x_px,
-        y_px: sticker.y_px,
-        font_size_px: sticker.font_size_px,
-        line_spacing: state.cfg.sticker.line_spacing,
-        threshold: sticker.threshold,
-        invert: sticker.invert,
-        trim_blank_top_bottom: sticker.trim_blank_top_bottom,
-        density: sticker.density,
-        address: state.cfg.printerd.address.clone(),
+    let render = match sticker.kind {
+        StickerKind::Text => {
+            let req = RenderTextRequest {
+                text: sticker.text.clone(),
+                font_path: state.cfg.sticker.font_path.clone(),
+                width_px: sticker.width_px,
+                height_px: sticker.height_px,
+                x_px: sticker.x_px,
+                y_px: sticker.y_px,
+                font_size_px: sticker.font_size_px,
+                line_spacing: state.cfg.sticker.line_spacing,
+                threshold: sticker.threshold,
+                invert: sticker.invert,
+                trim_blank_top_bottom: sticker.trim_blank_top_bottom,
+                density: sticker.density,
+                address: state.cfg.printerd.address.clone(),
+            };
+            state.printerd.render_text(&req).await?
+        }
+        StickerKind::Image => {
+            let source = sticker
+                .source_image_bytes
+                .clone()
+                .ok_or_else(|| anyhow!("missing source image in history"))?;
+            let req = RenderImageRequest {
+                image_base64: base64::engine::general_purpose::STANDARD.encode(source),
+                width_px: sticker.width_px.max(1),
+                max_height_px: Some(sticker.height_px.max(1)),
+                threshold: sticker.threshold,
+                dither_method: sticker
+                    .dither_method
+                    .unwrap_or(DitherMethod::FloydSteinberg),
+                invert: sticker.invert,
+                trim_blank_top_bottom: sticker.trim_blank_top_bottom,
+                density: sticker.density,
+                address: state.cfg.printerd.address.clone(),
+            };
+            state.printerd.render_image(&req).await?
+        }
     };
-
-    let render = state.printerd.render_text(&req).await?;
     let print_resp = state
         .printerd
         .print_render(
             &render.render_id,
-            req.density,
+            sticker.density,
             state.cfg.printerd.address.clone(),
         )
         .await?;
@@ -685,6 +869,22 @@ fn map_menu_button_to_command(text: &str) -> Option<Command> {
     }
 }
 
+fn parse_kind(kind: String) -> StickerKind {
+    if kind.eq_ignore_ascii_case("image") {
+        StickerKind::Image
+    } else {
+        StickerKind::Text
+    }
+}
+
+fn parse_dither_opt(v: Option<String>) -> Option<DitherMethod> {
+    match v.as_deref() {
+        Some("threshold") => Some(DitherMethod::Threshold),
+        Some("floyd_steinberg") => Some(DitherMethod::FloydSteinberg),
+        _ => None,
+    }
+}
+
 impl PrinterdClient {
     fn new(cfg: PrinterdConfig) -> Self {
         Self {
@@ -702,6 +902,19 @@ impl PrinterdClient {
             request = request.header("x-api-token", token);
         }
         let resp = request.send().await.context("printerd request failed")?;
+        parse_json_response(resp).await
+    }
+
+    async fn render_image(&self, req: &RenderImageRequest) -> Result<RenderTextResponse> {
+        let url = format!("{}/api/v1/renders/image", self.base_url);
+        let mut request = self.http.post(url).json(req);
+        if let Some(token) = &self.token {
+            request = request.header("x-api-token", token);
+        }
+        let resp = request
+            .send()
+            .await
+            .context("printerd image request failed")?;
         parse_json_response(resp).await
     }
 
@@ -782,6 +995,7 @@ async fn parse_json_response<T: for<'de> Deserialize<'de>>(resp: reqwest::Respon
 struct NewSticker {
     user_id: i64,
     chat_id: i64,
+    kind: StickerKind,
     text: String,
     width_px: u32,
     height_px: u32,
@@ -792,6 +1006,8 @@ struct NewSticker {
     invert: bool,
     trim_blank_top_bottom: bool,
     density: u8,
+    dither_method: Option<DitherMethod>,
+    source_image_bytes: Option<Vec<u8>>,
     preview_png: Vec<u8>,
 }
 
@@ -820,6 +1036,7 @@ impl Db {
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         user_id INTEGER NOT NULL,
                         chat_id INTEGER NOT NULL,
+                        kind TEXT NOT NULL DEFAULT 'text',
                         text TEXT NOT NULL,
                         width_px INTEGER NOT NULL,
                         height_px INTEGER NOT NULL,
@@ -830,6 +1047,8 @@ impl Db {
                         invert INTEGER NOT NULL,
                         trim_blank_top_bottom INTEGER NOT NULL,
                         density INTEGER NOT NULL,
+                        dither_method TEXT,
+                        source_image_bytes BLOB,
                         preview_png BLOB NOT NULL,
                         last_printer_job_id TEXT,
                         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -837,6 +1056,10 @@ impl Db {
                     CREATE INDEX IF NOT EXISTS idx_stickers_user_created ON stickers(user_id, id DESC);
                     ",
                 )?;
+                // Migrations for existing DBs.
+                let _ = conn.execute("ALTER TABLE stickers ADD COLUMN kind TEXT NOT NULL DEFAULT 'text'", []);
+                let _ = conn.execute("ALTER TABLE stickers ADD COLUMN dither_method TEXT", []);
+                let _ = conn.execute("ALTER TABLE stickers ADD COLUMN source_image_bytes BLOB", []);
                 Ok(())
             })
             .await
@@ -884,13 +1107,17 @@ impl Db {
             .call(move |conn| -> rusqlite::Result<i64> {
                 conn.execute(
                     "INSERT INTO stickers (
-                        user_id, chat_id, text, width_px, height_px, x_px, y_px,
+                        user_id, chat_id, kind, text, width_px, height_px, x_px, y_px,
                         font_size_px, threshold, invert, trim_blank_top_bottom,
-                        density, preview_png
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                        density, dither_method, source_image_bytes, preview_png
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                     (
                         s.user_id,
                         s.chat_id,
+                        match s.kind {
+                            StickerKind::Text => "text",
+                            StickerKind::Image => "image",
+                        },
                         s.text,
                         s.width_px as i64,
                         s.height_px as i64,
@@ -901,6 +1128,11 @@ impl Db {
                         if s.invert { 1 } else { 0 },
                         if s.trim_blank_top_bottom { 1 } else { 0 },
                         s.density as i64,
+                        s.dither_method.map(|m| match m {
+                            DitherMethod::Threshold => "threshold",
+                            DitherMethod::FloydSteinberg => "floyd_steinberg",
+                        }),
+                        s.source_image_bytes,
                         s.preview_png,
                     ),
                 )?;
@@ -914,8 +1146,8 @@ impl Db {
         self.conn
             .call(move |conn| -> rusqlite::Result<Option<StickerRecord>> {
                 let mut stmt = conn.prepare(
-                    "SELECT id, text, width_px, height_px, x_px, y_px, font_size_px,
-                            threshold, invert, trim_blank_top_bottom, density, preview_png, created_at
+                    "SELECT id, kind, text, width_px, height_px, x_px, y_px, font_size_px,
+                            threshold, invert, trim_blank_top_bottom, density, dither_method, source_image_bytes, preview_png, created_at
                      FROM stickers
                      WHERE id = ?1 AND user_id = ?2",
                 )?;
@@ -927,18 +1159,21 @@ impl Db {
 
                 Ok(Some(StickerRecord {
                     id: row.get(0)?,
-                    text: row.get(1)?,
-                    width_px: row.get::<_, i64>(2)? as u32,
-                    height_px: row.get::<_, i64>(3)? as u32,
-                    x_px: row.get(4)?,
-                    y_px: row.get(5)?,
-                    font_size_px: row.get(6)?,
-                    threshold: row.get::<_, i64>(7)? as u8,
-                    invert: row.get::<_, i64>(8)? != 0,
-                    trim_blank_top_bottom: row.get::<_, i64>(9)? != 0,
-                    density: row.get::<_, i64>(10)? as u8,
-                    preview_png: row.get(11)?,
-                    created_at: row.get(12)?,
+                    kind: parse_kind(row.get::<_, String>(1)?),
+                    text: row.get(2)?,
+                    width_px: row.get::<_, i64>(3)? as u32,
+                    height_px: row.get::<_, i64>(4)? as u32,
+                    x_px: row.get(5)?,
+                    y_px: row.get(6)?,
+                    font_size_px: row.get(7)?,
+                    threshold: row.get::<_, i64>(8)? as u8,
+                    invert: row.get::<_, i64>(9)? != 0,
+                    trim_blank_top_bottom: row.get::<_, i64>(10)? != 0,
+                    density: row.get::<_, i64>(11)? as u8,
+                    dither_method: parse_dither_opt(row.get::<_, Option<String>>(12)?),
+                    source_image_bytes: row.get(13)?,
+                    preview_png: row.get(14)?,
+                    created_at: row.get(15)?,
                 }))
             })
             .await
@@ -949,8 +1184,8 @@ impl Db {
         self.conn
             .call(move |conn| -> rusqlite::Result<Vec<StickerRecord>> {
                 let mut stmt = conn.prepare(
-                    "SELECT id, text, width_px, height_px, x_px, y_px, font_size_px,
-                            threshold, invert, trim_blank_top_bottom, density, preview_png, created_at
+                    "SELECT id, kind, text, width_px, height_px, x_px, y_px, font_size_px,
+                            threshold, invert, trim_blank_top_bottom, density, dither_method, source_image_bytes, preview_png, created_at
                      FROM stickers
                      WHERE user_id = ?1
                      ORDER BY id DESC
@@ -960,18 +1195,21 @@ impl Db {
                 let rows = stmt.query_map((user_id, limit), |row| {
                     Ok(StickerRecord {
                         id: row.get(0)?,
-                        text: row.get(1)?,
-                        width_px: row.get::<_, i64>(2)? as u32,
-                        height_px: row.get::<_, i64>(3)? as u32,
-                        x_px: row.get(4)?,
-                        y_px: row.get(5)?,
-                        font_size_px: row.get(6)?,
-                        threshold: row.get::<_, i64>(7)? as u8,
-                        invert: row.get::<_, i64>(8)? != 0,
-                        trim_blank_top_bottom: row.get::<_, i64>(9)? != 0,
-                        density: row.get::<_, i64>(10)? as u8,
-                        preview_png: row.get(11)?,
-                        created_at: row.get(12)?,
+                        kind: parse_kind(row.get::<_, String>(1)?),
+                        text: row.get(2)?,
+                        width_px: row.get::<_, i64>(3)? as u32,
+                        height_px: row.get::<_, i64>(4)? as u32,
+                        x_px: row.get(5)?,
+                        y_px: row.get(6)?,
+                        font_size_px: row.get(7)?,
+                        threshold: row.get::<_, i64>(8)? as u8,
+                        invert: row.get::<_, i64>(9)? != 0,
+                        trim_blank_top_bottom: row.get::<_, i64>(10)? != 0,
+                        density: row.get::<_, i64>(11)? as u8,
+                        dither_method: parse_dither_opt(row.get::<_, Option<String>>(12)?),
+                        source_image_bytes: row.get(13)?,
+                        preview_png: row.get(14)?,
+                        created_at: row.get(15)?,
                     })
                 })?;
 
