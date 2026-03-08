@@ -108,6 +108,9 @@ struct RenderTextRequest {
     threshold: Option<u8>,
     invert: Option<bool>,
     trim_blank_top_bottom: Option<bool>,
+    outline_only: Option<bool>,
+    outline_thickness_px: Option<u32>,
+    banner_mode: Option<bool>,
     density: Option<u8>,
     address: Option<String>,
 }
@@ -264,11 +267,21 @@ async fn render_text(
         return error_response(StatusCode::BAD_REQUEST, "text is empty".to_string());
     }
 
+    let banner_mode = req.banner_mode.unwrap_or(false);
     let width_px = req.width_px.unwrap_or(MAX_DOTS_PER_LINE as u32);
-    if width_px as usize > MAX_DOTS_PER_LINE {
+    if width_px == 0 {
+        return error_response(StatusCode::BAD_REQUEST, "width_px must be > 0".to_string());
+    }
+    if !banner_mode && width_px as usize > MAX_DOTS_PER_LINE {
         return error_response(
             StatusCode::BAD_REQUEST,
             format!("width_px exceeds max {}", MAX_DOTS_PER_LINE),
+        );
+    }
+    if banner_mode && width_px > 20000 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "width_px too large for banner mode (max 20000)".to_string(),
         );
     }
 
@@ -282,15 +295,27 @@ async fn render_text(
         threshold: req.threshold.unwrap_or(180),
         invert: req.invert.unwrap_or(false),
         trim_blank_top_bottom: req.trim_blank_top_bottom.unwrap_or(true),
+        outline_only: req.outline_only.unwrap_or(false),
+        outline_thickness_px: req.outline_thickness_px.unwrap_or(1).max(1),
     };
 
     let font_path = PathBuf::from(req.font_path);
-    let image = match render_text_to_image(&req.text, &font_path, &opts) {
+    let mut image = match render_text_to_image(&req.text, &font_path, &opts) {
         Ok(v) => v,
         Err(err) => {
             return error_response(StatusCode::BAD_REQUEST, format!("render failed: {err}"));
         }
     };
+
+    if banner_mode {
+        image = image::imageops::rotate90(&image);
+        if image.width() as usize > MAX_DOTS_PER_LINE {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("banner result width exceeds max {}", MAX_DOTS_PER_LINE),
+            );
+        }
+    }
 
     let packed = image_to_packed_lines(&image, opts.threshold, opts.trim_blank_top_bottom);
     if packed.is_empty() {
