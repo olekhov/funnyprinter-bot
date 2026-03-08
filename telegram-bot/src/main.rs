@@ -80,7 +80,10 @@ enum DitherMethod {
 
 #[derive(Debug, Clone, Deserialize)]
 struct AccessConfig {
+    #[serde(default)]
     allowed_user_ids: Vec<i64>,
+    #[serde(default)]
+    admin_user_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -205,6 +208,17 @@ struct AiGenerateRequest {
 struct AiGenerateResponse {
     image_base64: String,
     revised_prompt: Option<String>,
+    model: String,
+    size: String,
+    quality: String,
+    usage: Option<AiUsage>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct AiUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -243,6 +257,14 @@ enum Command {
     Ai,
     #[command(description = "последние стикеры")]
     History,
+    #[command(description = "статистика AI и пользователей")]
+    Stats,
+    #[command(description = "список пользователей (admin)")]
+    Users,
+    #[command(description = "добавить пользователя: /user_add <telegram_user_id> (admin)")]
+    UserAdd(String),
+    #[command(description = "удалить пользователя: /user_del <telegram_user_id> (admin)")]
+    UserDel(String),
 }
 
 #[tokio::main]
@@ -276,7 +298,12 @@ async fn main() -> Result<()> {
 
     let db = Db::open(&cfg.sqlite_path).await?;
     db.init().await?;
-    db.sync_allowlist(&cfg.access.allowed_user_ids).await?;
+    let admin_ids = if cfg.access.admin_user_ids.is_empty() {
+        cfg.access.allowed_user_ids.clone()
+    } else {
+        cfg.access.admin_user_ids.clone()
+    };
+    db.sync_users(&cfg.access.allowed_user_ids, &admin_ids).await?;
 
     let printerd = PrinterdClient::new(cfg.printerd.clone());
     let ai = AiServiceClient::new(cfg.ai_service.clone());
@@ -425,6 +452,23 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
                             let _ = bot.delete_message(msg.chat.id, progress_msg.id).await;
                         }
                         error!(user_id = user_id, error = %err, "failed to create ai sticker preview");
+                        let _ = state
+                            .db
+                            .insert_ai_generation(NewAiGeneration {
+                                user_id,
+                                chat_id: msg.chat.id.0,
+                                prompt: text.to_string(),
+                                revised_prompt: None,
+                                model: None,
+                                size: None,
+                                quality: None,
+                                input_tokens: None,
+                                output_tokens: None,
+                                total_tokens: None,
+                                status: "error".to_string(),
+                                error: Some(err.to_string()),
+                            })
+                            .await;
                         bot.send_message(msg.chat.id, format!("Ошибка AI генерации: {err}"))
                             .await?;
                     }
@@ -470,11 +514,13 @@ async fn handle_command(
     user_id: i64,
     cmd: Command,
 ) -> ResponseResult<()> {
+    let is_admin = state.db.is_admin(user_id).await.unwrap_or(false);
+
     match cmd {
         Command::Help | Command::Start => {
             bot.send_message(
                 msg.chat.id,
-                "Режимы:\n• 🏷 Простой стикер: отправьте текст.\n• 🤖 ИИ картинка: отправьте описание изображения.\nТакже можно отправить готовую картинку.\nПосле превью нажмите Печатать.",
+                "Режимы:\n• 🏷 Простой стикер: отправьте текст.\n• 🤖 ИИ картинка: отправьте описание изображения.\nТакже можно отправить готовую картинку.\n• 📊 Статистика: пользователи и токены AI.\nПосле превью нажмите Печатать.",
             )
             .reply_markup(main_menu_keyboard())
             .await?;
@@ -530,6 +576,109 @@ async fn handle_command(
                     .await?;
             }
         },
+        Command::Stats => match state.db.ai_stats().await {
+            Ok(stats) => {
+                let mut text = format!(
+                    "Статистика:\nПользователей в allowlist: {}\nAI генераций: {}\nAI токенов: {} (in: {}, out: {})",
+                    stats.allowed_users_count,
+                    stats.ai_generation_count,
+                    stats.total_tokens,
+                    stats.input_tokens,
+                    stats.output_tokens
+                );
+                if !stats.by_user.is_empty() {
+                    text.push_str("\n\nТоп по токенам:");
+                    for row in stats.by_user.iter().take(10) {
+                        text.push_str(&format!(
+                            "\n• {}: {} токенов, {} генераций",
+                            row.user_id, row.total_tokens, row.generation_count
+                        ));
+                    }
+                }
+                bot.send_message(msg.chat.id, text)
+                    .reply_markup(main_menu_keyboard())
+                    .await?;
+            }
+            Err(err) => {
+                bot.send_message(msg.chat.id, format!("Ошибка статистики: {err}"))
+                    .reply_markup(main_menu_keyboard())
+                    .await?;
+            }
+        },
+        Command::Users => {
+            if !is_admin {
+                bot.send_message(msg.chat.id, "Команда доступна только администратору.")
+                    .await?;
+                return Ok(());
+            }
+            match state.db.list_users().await {
+                Ok(users) if users.is_empty() => {
+                    bot.send_message(msg.chat.id, "Список пользователей пуст.")
+                        .await?;
+                }
+                Ok(users) => {
+                    let mut text = String::from("Пользователи:");
+                    for u in users {
+                        let role = if u.is_admin { "admin" } else { "user" };
+                        text.push_str(&format!("\n• {} [{}] {}", u.user_id, role, u.note));
+                    }
+                    bot.send_message(msg.chat.id, text).await?;
+                }
+                Err(err) => {
+                    bot.send_message(msg.chat.id, format!("Ошибка списка пользователей: {err}"))
+                        .await?;
+                }
+            }
+        }
+        Command::UserAdd(arg) => {
+            if !is_admin {
+                bot.send_message(msg.chat.id, "Команда доступна только администратору.")
+                    .await?;
+                return Ok(());
+            }
+            let Ok(target_user_id) = arg.trim().parse::<i64>() else {
+                bot.send_message(msg.chat.id, "Формат: /user_add <telegram_user_id>")
+                    .await?;
+                return Ok(());
+            };
+            let note = format!("added by admin {}", user_id);
+            match state.db.upsert_user(target_user_id, &note, false).await {
+                Ok(()) => {
+                    bot.send_message(msg.chat.id, format!("Пользователь {target_user_id} добавлен."))
+                        .await?;
+                }
+                Err(err) => {
+                    bot.send_message(msg.chat.id, format!("Ошибка добавления: {err}"))
+                        .await?;
+                }
+            }
+        }
+        Command::UserDel(arg) => {
+            if !is_admin {
+                bot.send_message(msg.chat.id, "Команда доступна только администратору.")
+                    .await?;
+                return Ok(());
+            }
+            let Ok(target_user_id) = arg.trim().parse::<i64>() else {
+                bot.send_message(msg.chat.id, "Формат: /user_del <telegram_user_id>")
+                    .await?;
+                return Ok(());
+            };
+            match state.db.delete_user(target_user_id).await {
+                Ok(true) => {
+                    bot.send_message(msg.chat.id, format!("Пользователь {target_user_id} удалён."))
+                        .await?;
+                }
+                Ok(false) => {
+                    bot.send_message(msg.chat.id, "Пользователь не найден.")
+                        .await?;
+                }
+                Err(err) => {
+                    bot.send_message(msg.chat.id, format!("Ошибка удаления: {err}"))
+                        .await?;
+                }
+            }
+        }
     }
 
     Ok(())
@@ -769,6 +918,23 @@ async fn create_ai_image_sticker(
         false,
     )
     .await?;
+    state
+        .db
+        .insert_ai_generation(NewAiGeneration {
+            user_id,
+            chat_id,
+            prompt: prompt.to_string(),
+            revised_prompt: ai.revised_prompt.clone(),
+            model: Some(ai.model.clone()),
+            size: Some(ai.size.clone()),
+            quality: Some(ai.quality.clone()),
+            input_tokens: ai.usage.as_ref().and_then(|u| u.input_tokens),
+            output_tokens: ai.usage.as_ref().and_then(|u| u.output_tokens),
+            total_tokens: ai.usage.as_ref().and_then(|u| u.total_tokens),
+            status: "ok".to_string(),
+            error: None,
+        })
+        .await?;
     Ok((sticker, ai.revised_prompt))
 }
 
@@ -1050,6 +1216,7 @@ fn main_menu_keyboard() -> KeyboardMarkup {
         vec![
             KeyboardButton::new("🆘 Помощь"),
             KeyboardButton::new("🗂 История"),
+            KeyboardButton::new("📊 Статистика"),
         ],
         vec![
             KeyboardButton::new("🏷 Простой стикер"),
@@ -1063,6 +1230,7 @@ fn map_menu_button_to_command(text: &str) -> Option<Command> {
     match text.trim() {
         "🆘 Помощь" => Some(Command::Help),
         "🗂 История" => Some(Command::History),
+        "📊 Статистика" => Some(Command::Stats),
         "🏷 Простой стикер" => Some(Command::Simple),
         "🤖 ИИ картинка" => Some(Command::Ai),
         _ => None,
@@ -1241,6 +1409,42 @@ struct NewSticker {
     preview_png: Vec<u8>,
 }
 
+struct NewAiGeneration {
+    user_id: i64,
+    chat_id: i64,
+    prompt: String,
+    revised_prompt: Option<String>,
+    model: Option<String>,
+    size: Option<String>,
+    quality: Option<String>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    status: String,
+    error: Option<String>,
+}
+
+struct AiStatsSummary {
+    allowed_users_count: u64,
+    ai_generation_count: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    by_user: Vec<AiStatsByUser>,
+}
+
+struct AiStatsByUser {
+    user_id: i64,
+    generation_count: u64,
+    total_tokens: u64,
+}
+
+struct AllowedUser {
+    user_id: i64,
+    is_admin: bool,
+    note: String,
+}
+
 impl Db {
     async fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)
@@ -1259,6 +1463,7 @@ impl Db {
                     PRAGMA journal_mode = WAL;
                     CREATE TABLE IF NOT EXISTS allowed_users (
                         user_id INTEGER PRIMARY KEY,
+                        is_admin INTEGER NOT NULL DEFAULT 0,
                         note TEXT,
                         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
                     );
@@ -1284,9 +1489,30 @@ impl Db {
                         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
                     );
                     CREATE INDEX IF NOT EXISTS idx_stickers_user_created ON stickers(user_id, id DESC);
+                    CREATE TABLE IF NOT EXISTS ai_generations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        chat_id INTEGER NOT NULL,
+                        prompt TEXT NOT NULL,
+                        revised_prompt TEXT,
+                        model TEXT,
+                        size TEXT,
+                        quality TEXT,
+                        input_tokens INTEGER,
+                        output_tokens INTEGER,
+                        total_tokens INTEGER,
+                        status TEXT NOT NULL,
+                        error TEXT,
+                        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_ai_generations_user_created ON ai_generations(user_id, id DESC);
                     ",
                 )?;
                 // Migrations for existing DBs.
+                let _ = conn.execute(
+                    "ALTER TABLE allowed_users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0",
+                    [],
+                );
                 let _ = conn.execute("ALTER TABLE stickers ADD COLUMN kind TEXT NOT NULL DEFAULT 'text'", []);
                 let _ = conn.execute("ALTER TABLE stickers ADD COLUMN dither_method TEXT", []);
                 let _ = conn.execute("ALTER TABLE stickers ADD COLUMN source_image_bytes BLOB", []);
@@ -1297,16 +1523,29 @@ impl Db {
         Ok(())
     }
 
-    async fn sync_allowlist(&self, user_ids: &[i64]) -> Result<()> {
+    async fn sync_users(&self, user_ids: &[i64], admin_ids: &[i64]) -> Result<()> {
         let ids = user_ids.to_vec();
+        let admins = admin_ids.to_vec();
         self.conn
             .call(move |conn| -> rusqlite::Result<()> {
                 let tx = conn.transaction()?;
                 {
                     let mut stmt = tx.prepare(
-                        "INSERT OR IGNORE INTO allowed_users (user_id, note) VALUES (?1, 'from config')",
+                        "INSERT INTO allowed_users (user_id, is_admin, note)
+                         VALUES (?1, 0, 'from config')
+                         ON CONFLICT(user_id) DO UPDATE SET note = excluded.note",
                     )?;
                     for uid in ids {
+                        stmt.execute([uid])?;
+                    }
+                }
+                {
+                    let mut stmt = tx.prepare(
+                        "INSERT INTO allowed_users (user_id, is_admin, note)
+                         VALUES (?1, 1, 'admin from config')
+                         ON CONFLICT(user_id) DO UPDATE SET is_admin = 1, note = excluded.note",
+                    )?;
+                    for uid in admins {
                         stmt.execute([uid])?;
                     }
                 }
@@ -1314,7 +1553,7 @@ impl Db {
                 Ok(())
             })
             .await
-            .map_err(|e| anyhow!("failed to sync allowlist: {e}"))?;
+            .map_err(|e| anyhow!("failed to sync users: {e}"))?;
         Ok(())
     }
 
@@ -1330,6 +1569,71 @@ impl Db {
             })
             .await
             .map_err(|e| anyhow!("failed to check allowlist: {e}"))
+    }
+
+    async fn is_admin(&self, user_id: i64) -> Result<bool> {
+        self.conn
+            .call(move |conn| -> rusqlite::Result<bool> {
+                let exists: i64 = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM allowed_users WHERE user_id = ?1 AND is_admin = 1)",
+                    [user_id],
+                    |row| row.get(0),
+                )?;
+                Ok(exists == 1)
+            })
+            .await
+            .map_err(|e| anyhow!("failed to check admin role: {e}"))
+    }
+
+    async fn upsert_user(&self, user_id: i64, note: &str, is_admin: bool) -> Result<()> {
+        let note = note.to_string();
+        self.conn
+            .call(move |conn| -> rusqlite::Result<()> {
+                conn.execute(
+                    "INSERT INTO allowed_users (user_id, is_admin, note)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(user_id) DO UPDATE SET is_admin = excluded.is_admin, note = excluded.note",
+                    (user_id, if is_admin { 1 } else { 0 }, note),
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow!("failed to upsert user: {e}"))
+    }
+
+    async fn delete_user(&self, user_id: i64) -> Result<bool> {
+        self.conn
+            .call(move |conn| -> rusqlite::Result<bool> {
+                let changed = conn.execute("DELETE FROM allowed_users WHERE user_id = ?1", [user_id])?;
+                Ok(changed > 0)
+            })
+            .await
+            .map_err(|e| anyhow!("failed to delete user: {e}"))
+    }
+
+    async fn list_users(&self) -> Result<Vec<AllowedUser>> {
+        self.conn
+            .call(move |conn| -> rusqlite::Result<Vec<AllowedUser>> {
+                let mut stmt = conn.prepare(
+                    "SELECT user_id, is_admin, COALESCE(note, '')
+                     FROM allowed_users
+                     ORDER BY is_admin DESC, user_id ASC",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok(AllowedUser {
+                        user_id: row.get(0)?,
+                        is_admin: row.get::<_, i64>(1)? != 0,
+                        note: row.get(2)?,
+                    })
+                })?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            })
+            .await
+            .map_err(|e| anyhow!("failed to list users: {e}"))
     }
 
     async fn insert_sticker(&self, s: NewSticker) -> Result<i64> {
@@ -1370,6 +1674,90 @@ impl Db {
             })
             .await
             .map_err(|e| anyhow!("failed to insert sticker: {e}"))
+    }
+
+    async fn insert_ai_generation(&self, g: NewAiGeneration) -> Result<i64> {
+        self.conn
+            .call(move |conn| -> rusqlite::Result<i64> {
+                conn.execute(
+                    "INSERT INTO ai_generations (
+                        user_id, chat_id, prompt, revised_prompt, model, size, quality,
+                        input_tokens, output_tokens, total_tokens, status, error
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    (
+                        g.user_id,
+                        g.chat_id,
+                        g.prompt,
+                        g.revised_prompt,
+                        g.model,
+                        g.size,
+                        g.quality,
+                        g.input_tokens.map(|v| v as i64),
+                        g.output_tokens.map(|v| v as i64),
+                        g.total_tokens.map(|v| v as i64),
+                        g.status,
+                        g.error,
+                    ),
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .await
+            .map_err(|e| anyhow!("failed to insert ai generation: {e}"))
+    }
+
+    async fn ai_stats(&self) -> Result<AiStatsSummary> {
+        self.conn
+            .call(move |conn| -> rusqlite::Result<AiStatsSummary> {
+                let allowed_users_count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM allowed_users", [], |row| row.get(0))?;
+                let (ai_generation_count, input_tokens, output_tokens, total_tokens): (
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                ) = conn.query_row(
+                    "SELECT
+                        COUNT(*),
+                        COALESCE(SUM(input_tokens), 0),
+                        COALESCE(SUM(output_tokens), 0),
+                        COALESCE(SUM(total_tokens), 0)
+                     FROM ai_generations
+                     WHERE status = 'ok'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?;
+
+                let mut stmt = conn.prepare(
+                    "SELECT user_id, COUNT(*) AS cnt, COALESCE(SUM(total_tokens), 0) AS tokens
+                     FROM ai_generations
+                     WHERE status = 'ok'
+                     GROUP BY user_id
+                     ORDER BY tokens DESC, cnt DESC
+                     LIMIT 20",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok(AiStatsByUser {
+                        user_id: row.get(0)?,
+                        generation_count: row.get::<_, i64>(1)? as u64,
+                        total_tokens: row.get::<_, i64>(2)? as u64,
+                    })
+                })?;
+                let mut by_user = Vec::new();
+                for row in rows {
+                    by_user.push(row?);
+                }
+
+                Ok(AiStatsSummary {
+                    allowed_users_count: allowed_users_count as u64,
+                    ai_generation_count: ai_generation_count as u64,
+                    input_tokens: input_tokens as u64,
+                    output_tokens: output_tokens as u64,
+                    total_tokens: total_tokens as u64,
+                    by_user,
+                })
+            })
+            .await
+            .map_err(|e| anyhow!("failed to get ai stats: {e}"))
     }
 
     async fn get_sticker_for_user(&self, id: i64, user_id: i64) -> Result<Option<StickerRecord>> {

@@ -50,6 +50,8 @@ struct GenerateResponse {
     revised_prompt: Option<String>,
     model: String,
     size: String,
+    quality: String,
+    usage: Option<GenerationUsage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,12 +71,27 @@ struct OpenAiImageRequest {
 #[derive(Debug, Deserialize)]
 struct OpenAiImageResponse {
     data: Vec<OpenAiImageData>,
+    usage: Option<OpenAiUsage>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAiImageData {
     b64_json: Option<String>,
     revised_prompt: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct GenerationUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,18 +197,20 @@ Hard edges, high contrast.";
         model: state.model.clone(),
         prompt: final_prompt,
         size: size.clone(),
-        quality,
+        quality: quality.clone(),
         n,
     };
 
     match generate_openai_image(&state, oa_req).await {
-        Ok((image_base64, revised_prompt)) => {
+        Ok((image_base64, revised_prompt, usage)) => {
             info!(model = %state.model, size = %size, "image generated");
             let out = GenerateResponse {
                 image_base64,
                 revised_prompt,
                 model: state.model.clone(),
                 size,
+                quality,
+                usage,
             };
             (StatusCode::OK, axum::Json(out)).into_response()
         }
@@ -208,7 +227,7 @@ Hard edges, high contrast.";
 async fn generate_openai_image(
     state: &AppState,
     req: OpenAiImageRequest,
-) -> Result<(String, Option<String>)> {
+) -> Result<(String, Option<String>, Option<GenerationUsage>)> {
     let resp = state
         .http
         .post("https://api.openai.com/v1/images/generations")
@@ -234,6 +253,11 @@ async fn generate_openai_image(
 
     let decoded: OpenAiImageResponse =
         serde_json::from_slice(&bytes).context("failed to decode OpenAI image response")?;
+    let usage = decoded.usage.map(|u| GenerationUsage {
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        total_tokens: u.total_tokens,
+    });
     let first = decoded
         .data
         .into_iter()
@@ -243,7 +267,7 @@ async fn generate_openai_image(
         .b64_json
         .ok_or_else(|| anyhow::anyhow!("OpenAI response has no b64_json"))?;
 
-    Ok((b64, first.revised_prompt))
+    Ok((b64, first.revised_prompt, usage))
 }
 
 fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {

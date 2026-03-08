@@ -179,7 +179,7 @@ Prepared deployment files are in `deploy/`:
 4. User presses `Печатать`.
 5. Bot re-renders by saved parameters and sends print request.
 6. Button becomes `Напечатать ещё раз` for quick reprint.
-7. Bot shows menu buttons (`Помощь`, `История`, `Простой стикер`) as reply keyboard.
+7. Bot shows menu buttons (`Помощь`, `История`, `Статистика`, `Простой стикер`) as reply keyboard.
 8. User can also send an image; bot resizes to printer width (`384px`), applies threshold/dithering and returns preview.
 9. AI mode: press `🤖 ИИ картинка`, send text prompt, bot requests `ai-service`, then returns print preview.
 
@@ -188,7 +188,12 @@ Prepared deployment files are in `deploy/`:
 Only users from `allowed_users` SQLite table can use the bot.
 
 - Initial seeding is done from `access.allowed_user_ids` in config.
-- To add/remove manually on Raspberry Pi:
+- Admin IDs are seeded from `access.admin_user_ids` (if empty, all `allowed_user_ids` become admins).
+- In bot (admin only):
+  - `/users`
+  - `/user_add <telegram_user_id>`
+  - `/user_del <telegram_user_id>`
+- You can still add/remove manually on Raspberry Pi:
 
 ```bash
 sqlite3 printerbot.sqlite3 "INSERT OR IGNORE INTO allowed_users (user_id, note) VALUES (123456789, 'manual');"

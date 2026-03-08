@@ -37,3 +37,4 @@ trim_blank_top_bottom = false
 
 [access]
 allowed_user_ids = [123456789]
+admin_user_ids = [123456789]

@@ -12,7 +12,8 @@ services:
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       RUST_LOG: ${RUST_LOG:-info}
-    command: ["/usr/local/bin/ai-service", "--listen", "0.0.0.0:8090", "--model", "gpt-image-1.5"]
+    #command: ["/usr/local/bin/ai-service", "--listen", "0.0.0.0:8090", "--model", "gpt-image-1.5"]
+    command: ["/usr/local/bin/ai-service", "--listen", "0.0.0.0:8090"]
     networks:
       - printerbot
 
