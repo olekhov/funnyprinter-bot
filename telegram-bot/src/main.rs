@@ -97,6 +97,9 @@ struct AiServiceConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputMode {
     SimpleText,
+    OutlineText,
+    Banner,
+    BannerOutline,
     AiImage,
 }
 
@@ -155,6 +158,9 @@ struct StickerRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StickerKind {
     Text,
+    TextOutline,
+    TextBanner,
+    TextBannerOutline,
     Image,
 }
 
@@ -171,6 +177,9 @@ struct RenderTextRequest {
     threshold: u8,
     invert: bool,
     trim_blank_top_bottom: bool,
+    outline_only: bool,
+    outline_thickness_px: u32,
+    banner_mode: bool,
     density: u8,
     address: Option<String>,
 }
@@ -253,6 +262,12 @@ enum Command {
     Start,
     #[command(description = "режим простого стикера")]
     Simple,
+    #[command(description = "режим контурного текста")]
+    Outline,
+    #[command(description = "режим баннера")]
+    Banner,
+    #[command(description = "режим баннера контуром")]
+    BannerOutline,
     #[command(description = "режим ИИ картинки")]
     Ai,
     #[command(description = "последние стикеры")]
@@ -376,7 +391,15 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
 
         match mode {
             InputMode::SimpleText => {
-                match create_simple_sticker(&state, user_id, msg.chat.id.0, text).await {
+                match create_text_sticker(
+                    &state,
+                    user_id,
+                    msg.chat.id.0,
+                    text,
+                    StickerKind::Text,
+                )
+                .await
+                {
                     Ok(record) => {
                         info!(
                             user_id = user_id,
@@ -397,6 +420,87 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
                     }
                     Err(err) => {
                         error!(user_id = user_id, error = %err, "failed to create text sticker preview");
+                        bot.send_message(msg.chat.id, format!("Ошибка рендера: {err}"))
+                            .await?;
+                    }
+                }
+            }
+            InputMode::OutlineText => {
+                match create_text_sticker(
+                    &state,
+                    user_id,
+                    msg.chat.id.0,
+                    text,
+                    StickerKind::TextOutline,
+                )
+                .await
+                {
+                    Ok(record) => {
+                        info!(user_id = user_id, sticker_id = record.id, "created outline text preview");
+                        bot.send_photo(
+                            msg.chat.id,
+                            InputFile::memory(record.preview_png.clone()).file_name("preview.png"),
+                        )
+                        .caption("Превью контурного текста.\nНажмите кнопку для печати.")
+                        .reply_markup(print_keyboard(record.id))
+                        .await?;
+                    }
+                    Err(err) => {
+                        error!(user_id = user_id, error = %err, "failed to create outline text preview");
+                        bot.send_message(msg.chat.id, format!("Ошибка рендера: {err}"))
+                            .await?;
+                    }
+                }
+            }
+            InputMode::Banner => {
+                match create_text_sticker(
+                    &state,
+                    user_id,
+                    msg.chat.id.0,
+                    text,
+                    StickerKind::TextBanner,
+                )
+                .await
+                {
+                    Ok(record) => {
+                        info!(user_id = user_id, sticker_id = record.id, "created banner preview");
+                        bot.send_photo(
+                            msg.chat.id,
+                            InputFile::memory(record.preview_png.clone()).file_name("preview.png"),
+                        )
+                        .caption("Превью баннера.\nНажмите кнопку для печати.")
+                        .reply_markup(print_keyboard(record.id))
+                        .await?;
+                    }
+                    Err(err) => {
+                        error!(user_id = user_id, error = %err, "failed to create banner preview");
+                        bot.send_message(msg.chat.id, format!("Ошибка рендера: {err}"))
+                            .await?;
+                    }
+                }
+            }
+            InputMode::BannerOutline => {
+                match create_text_sticker(
+                    &state,
+                    user_id,
+                    msg.chat.id.0,
+                    text,
+                    StickerKind::TextBannerOutline,
+                )
+                .await
+                {
+                    Ok(record) => {
+                        info!(user_id = user_id, sticker_id = record.id, "created banner outline preview");
+                        bot.send_photo(
+                            msg.chat.id,
+                            InputFile::memory(record.preview_png.clone()).file_name("preview.png"),
+                        )
+                        .caption("Превью баннера (контур).\nНажмите кнопку для печати.")
+                        .reply_markup(print_keyboard(record.id))
+                        .await?;
+                    }
+                    Err(err) => {
+                        error!(user_id = user_id, error = %err, "failed to create banner outline preview");
                         bot.send_message(msg.chat.id, format!("Ошибка рендера: {err}"))
                             .await?;
                     }
@@ -520,7 +624,7 @@ async fn handle_command(
         Command::Help | Command::Start => {
             bot.send_message(
                 msg.chat.id,
-                "Режимы:\n• 🏷 Простой стикер: отправьте текст.\n• 🤖 ИИ картинка: отправьте описание изображения.\nТакже можно отправить готовую картинку.\n• 📊 Статистика: пользователи и токены AI.\nПосле превью нажмите Печатать.",
+                "Режимы:\n• 🏷 Простой стикер: отправьте текст.\n• ✏️ Контур текста: буквы без заливки.\n• 🧾 Баннер: печать вдоль ленты.\n• 🧾✏️ Баннер контуром.\n• 🤖 ИИ картинка: отправьте описание изображения.\nТакже можно отправить готовую картинку.\n• 📊 Статистика: пользователи и токены AI.\nПосле превью нажмите Печатать.",
             )
             .reply_markup(main_menu_keyboard())
             .await?;
@@ -533,6 +637,42 @@ async fn handle_command(
             bot.send_message(
                 msg.chat.id,
                 "Режим: простой стикер. Просто отправьте текст следующим сообщением.",
+            )
+            .reply_markup(main_menu_keyboard())
+            .await?;
+        }
+        Command::Outline => {
+            {
+                let mut modes = state.user_modes.write().await;
+                modes.insert(user_id, InputMode::OutlineText);
+            }
+            bot.send_message(
+                msg.chat.id,
+                "Режим: контур текста. Отправьте текст следующим сообщением.",
+            )
+            .reply_markup(main_menu_keyboard())
+            .await?;
+        }
+        Command::Banner => {
+            {
+                let mut modes = state.user_modes.write().await;
+                modes.insert(user_id, InputMode::Banner);
+            }
+            bot.send_message(
+                msg.chat.id,
+                "Режим: баннер. Текст печатается вдоль ленты.",
+            )
+            .reply_markup(main_menu_keyboard())
+            .await?;
+        }
+        Command::BannerOutline => {
+            {
+                let mut modes = state.user_modes.write().await;
+                modes.insert(user_id, InputMode::BannerOutline);
+            }
+            bot.send_message(
+                msg.chat.id,
+                "Режим: баннер контуром. Текст вдоль ленты и без заливки.",
             )
             .reply_markup(main_menu_keyboard())
             .await?;
@@ -781,45 +921,88 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
     Ok(())
 }
 
-async fn create_simple_sticker(
+async fn create_text_sticker(
     state: &AppState,
     user_id: i64,
     chat_id: i64,
     text: &str,
+    kind: StickerKind,
 ) -> Result<StickerRecord> {
     let cfg = &state.cfg.sticker;
-    let content_width = cfg
-        .printer_width_px
-        .saturating_sub(cfg.margin_left_px)
-        .saturating_sub(cfg.margin_right_px);
-    if content_width < 16 {
-        bail!("configured margins leave no content width");
-    }
+    let is_banner = matches!(kind, StickerKind::TextBanner | StickerKind::TextBannerOutline);
+    let outline_only = matches!(kind, StickerKind::TextOutline | StickerKind::TextBannerOutline);
 
-    let (font_size, text_height) = fit_font_size(
-        &state.font,
-        text,
-        content_width as f32,
-        cfg.min_font_size_px,
-        cfg.max_font_size_px,
-        cfg.line_spacing,
-    )?;
+    let (width_px, height_px, x_px, y_px, font_size) = if is_banner {
+        let content_height = cfg
+            .printer_width_px
+            .saturating_sub(cfg.margin_top_px)
+            .saturating_sub(cfg.margin_bottom_px);
+        if content_height < 12 {
+            bail!("configured margins leave no content height for banner mode");
+        }
+        let (font_size, _) = fit_font_size_by_height(
+            &state.font,
+            text,
+            content_height as f32,
+            cfg.min_font_size_px,
+            cfg.max_font_size_px,
+            cfg.line_spacing,
+        )?;
+        let (text_width, text_height) = measure_text_block(&state.font, text, font_size, cfg.line_spacing);
+        let width_px = (cfg.margin_left_px + cfg.margin_right_px + text_width.ceil() as u32 + 2).max(16);
+        let y_px = cfg.margin_top_px as i32
+            + ((content_height as i32 - text_height.ceil() as i32).max(0) / 2);
+        (
+            width_px,
+            cfg.printer_width_px,
+            cfg.margin_left_px as i32,
+            y_px,
+            font_size,
+        )
+    } else {
+        let content_width = cfg
+            .printer_width_px
+            .saturating_sub(cfg.margin_left_px)
+            .saturating_sub(cfg.margin_right_px);
+        if content_width < 16 {
+            bail!("configured margins leave no content width");
+        }
 
-    let height_px =
-        (cfg.margin_top_px + cfg.margin_bottom_px + text_height.ceil() as u32 + 2).max(16);
+        let (font_size, text_height) = fit_font_size(
+            &state.font,
+            text,
+            content_width as f32,
+            cfg.min_font_size_px,
+            cfg.max_font_size_px,
+            cfg.line_spacing,
+        )?;
+
+        let height_px =
+            (cfg.margin_top_px + cfg.margin_bottom_px + text_height.ceil() as u32 + 2).max(16);
+        (
+            cfg.printer_width_px,
+            height_px,
+            cfg.margin_left_px as i32,
+            cfg.margin_top_px as i32,
+            font_size,
+        )
+    };
 
     let req = RenderTextRequest {
         text: text.to_string(),
         font_path: cfg.font_path.clone(),
-        width_px: cfg.printer_width_px,
+        width_px,
         height_px,
-        x_px: cfg.margin_left_px as i32,
-        y_px: cfg.margin_top_px as i32,
+        x_px,
+        y_px,
         font_size_px: font_size,
         line_spacing: cfg.line_spacing,
         threshold: cfg.threshold,
         invert: cfg.invert,
         trim_blank_top_bottom: cfg.trim_blank_top_bottom,
+        outline_only,
+        outline_thickness_px: 1,
+        banner_mode: is_banner,
         density: cfg.density,
         address: state.cfg.printerd.address.clone(),
     };
@@ -832,7 +1015,7 @@ async fn create_simple_sticker(
         .insert_sticker(NewSticker {
             user_id,
             chat_id,
-            kind: StickerKind::Text,
+            kind,
             text: text.to_string(),
             width_px: req.width_px,
             height_px: req.height_px,
@@ -851,7 +1034,7 @@ async fn create_simple_sticker(
 
     Ok(StickerRecord {
         id,
-        kind: StickerKind::Text,
+        kind,
         text: text.to_string(),
         width_px: req.width_px,
         height_px: req.height_px,
@@ -1033,7 +1216,18 @@ async fn process_print_action(state: &AppState, user_id: i64, sticker_id: i64) -
     };
 
     let render = match sticker.kind {
-        StickerKind::Text => {
+        StickerKind::Text
+        | StickerKind::TextOutline
+        | StickerKind::TextBanner
+        | StickerKind::TextBannerOutline => {
+            let outline_only = matches!(
+                sticker.kind,
+                StickerKind::TextOutline | StickerKind::TextBannerOutline
+            );
+            let banner_mode = matches!(
+                sticker.kind,
+                StickerKind::TextBanner | StickerKind::TextBannerOutline
+            );
             let req = RenderTextRequest {
                 text: sticker.text.clone(),
                 font_path: state.cfg.sticker.font_path.clone(),
@@ -1046,6 +1240,9 @@ async fn process_print_action(state: &AppState, user_id: i64, sticker_id: i64) -
                 threshold: sticker.threshold,
                 invert: sticker.invert,
                 trim_blank_top_bottom: sticker.trim_blank_top_bottom,
+                outline_only,
+                outline_thickness_px: 1,
+                banner_mode,
                 density: sticker.density,
                 address: state.cfg.printerd.address.clone(),
             };
@@ -1145,6 +1342,38 @@ fn fit_font_size(
     Ok((lo, h.max(min_h)))
 }
 
+fn fit_font_size_by_height(
+    font: &FontArc,
+    text: &str,
+    max_height: f32,
+    min_size: f32,
+    max_size: f32,
+    line_spacing: f32,
+) -> Result<(f32, f32)> {
+    if min_size <= 0.0 || max_size <= 0.0 || min_size > max_size {
+        bail!("invalid font size bounds");
+    }
+
+    let (_, min_h) = measure_text_block(font, text, min_size, line_spacing);
+    if min_h > max_height {
+        bail!("text is too tall even at minimum font size {:.1}", min_size);
+    }
+
+    let mut lo = min_size;
+    let mut hi = max_size;
+    for _ in 0..24 {
+        let mid = (lo + hi) / 2.0;
+        let (_, h) = measure_text_block(font, text, mid, line_spacing);
+        if h <= max_height {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let (_, h) = measure_text_block(font, text, lo, line_spacing);
+    Ok((lo, h))
+}
+
 fn build_ai_lineart_prompt(user_prompt: &str) -> String {
     format!(
         "Create black ink line art for thermal sticker printing. \
@@ -1220,6 +1449,13 @@ fn main_menu_keyboard() -> KeyboardMarkup {
         ],
         vec![
             KeyboardButton::new("🏷 Простой стикер"),
+            KeyboardButton::new("✏️ Контур текста"),
+        ],
+        vec![
+            KeyboardButton::new("🧾 Баннер"),
+            KeyboardButton::new("🧾✏️ Баннер контуром"),
+        ],
+        vec![
             KeyboardButton::new("🤖 ИИ картинка"),
         ],
     ])
@@ -1232,16 +1468,21 @@ fn map_menu_button_to_command(text: &str) -> Option<Command> {
         "🗂 История" => Some(Command::History),
         "📊 Статистика" => Some(Command::Stats),
         "🏷 Простой стикер" => Some(Command::Simple),
+        "✏️ Контур текста" => Some(Command::Outline),
+        "🧾 Баннер" => Some(Command::Banner),
+        "🧾✏️ Баннер контуром" => Some(Command::BannerOutline),
         "🤖 ИИ картинка" => Some(Command::Ai),
         _ => None,
     }
 }
 
 fn parse_kind(kind: String) -> StickerKind {
-    if kind.eq_ignore_ascii_case("image") {
-        StickerKind::Image
-    } else {
-        StickerKind::Text
+    match kind.as_str() {
+        "image" => StickerKind::Image,
+        "text_outline" => StickerKind::TextOutline,
+        "text_banner" => StickerKind::TextBanner,
+        "text_banner_outline" => StickerKind::TextBannerOutline,
+        _ => StickerKind::Text,
     }
 }
 
@@ -1650,6 +1891,9 @@ impl Db {
                         s.chat_id,
                         match s.kind {
                             StickerKind::Text => "text",
+                            StickerKind::TextOutline => "text_outline",
+                            StickerKind::TextBanner => "text_banner",
+                            StickerKind::TextBannerOutline => "text_banner_outline",
                             StickerKind::Image => "image",
                         },
                         s.text,

@@ -17,6 +17,8 @@ pub struct TextRenderOptions {
     pub threshold: u8,
     pub invert: bool,
     pub trim_blank_top_bottom: bool,
+    pub outline_only: bool,
+    pub outline_thickness_px: u32,
 }
 
 impl Default for TextRenderOptions {
@@ -31,6 +33,8 @@ impl Default for TextRenderOptions {
             threshold: 180,
             invert: false,
             trim_blank_top_bottom: true,
+            outline_only: false,
+            outline_thickness_px: 1,
         }
     }
 }
@@ -58,6 +62,10 @@ pub fn render_text_to_image(
         draw_text_mut(&mut img, Luma([0]), opts.x_px, y, scale, &font, line);
     }
 
+    if opts.outline_only {
+        img = outline_from_mask(&img, opts.outline_thickness_px.max(1));
+    }
+
     if opts.invert {
         for pixel in img.pixels_mut() {
             pixel.0[0] = 255u8.saturating_sub(pixel.0[0]);
@@ -65,6 +73,40 @@ pub fn render_text_to_image(
     }
 
     Ok(img)
+}
+
+fn outline_from_mask(src: &GrayImage, radius: u32) -> GrayImage {
+    let w = src.width();
+    let h = src.height();
+    let mut out = GrayImage::from_pixel(w, h, Luma([255]));
+    let r = radius as i32;
+
+    for y in 0..h {
+        for x in 0..w {
+            let mut has_fg = false;
+            let mut has_bg = false;
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                        has_bg = true;
+                        continue;
+                    }
+                    let px = src.get_pixel(nx as u32, ny as u32).0[0];
+                    if px < 200 {
+                        has_fg = true;
+                    } else {
+                        has_bg = true;
+                    }
+                }
+            }
+            if has_fg && has_bg {
+                out.put_pixel(x, y, Luma([0]));
+            }
+        }
+    }
+    out
 }
 
 pub fn image_to_packed_lines(img: &GrayImage, threshold: u8, trim_blank: bool) -> Vec<PackedLine> {
