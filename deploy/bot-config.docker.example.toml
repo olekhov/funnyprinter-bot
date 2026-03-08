@@ -15,6 +15,7 @@ default_quality = "low"
 
 [sticker]
 font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+outline_font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 printer_width_px = 384
 margin_left_px = 10
 margin_right_px = 10
@@ -22,6 +23,7 @@ margin_top_px = 12
 margin_bottom_px = 12
 min_font_size_px = 14.0
 max_font_size_px = 92.0
+banner_max_font_size_px = 128.0
 line_spacing = 1.1
 threshold = 180
 density = 3

@@ -48,6 +48,7 @@ struct PrinterdConfig {
 #[derive(Debug, Clone, Deserialize)]
 struct StickerConfig {
     font_path: String,
+    outline_font_path: Option<String>,
     printer_width_px: u32,
     margin_left_px: u32,
     margin_right_px: u32,
@@ -55,6 +56,7 @@ struct StickerConfig {
     margin_bottom_px: u32,
     min_font_size_px: f32,
     max_font_size_px: f32,
+    banner_max_font_size_px: Option<f32>,
     line_spacing: f32,
     threshold: u8,
     density: u8,
@@ -110,6 +112,7 @@ struct AppState {
     printerd: PrinterdClient,
     ai: AiServiceClient,
     font: FontArc,
+    outline_font: Option<FontArc>,
     user_modes: Arc<RwLock<std::collections::HashMap<i64, InputMode>>>,
 }
 
@@ -305,11 +308,24 @@ async fn main() -> Result<()> {
     if cfg.sticker.printer_width_px == 0 {
         bail!("sticker.printer_width_px must be > 0");
     }
+    if let Some(v) = cfg.sticker.banner_max_font_size_px {
+        if v < cfg.sticker.min_font_size_px {
+            bail!("sticker.banner_max_font_size_px must be >= sticker.min_font_size_px");
+        }
+    }
 
     let font_bytes = tokio::fs::read(&cfg.sticker.font_path)
         .await
         .with_context(|| format!("failed to read font {}", cfg.sticker.font_path))?;
     let font = FontArc::try_from_vec(font_bytes).context("failed to parse font")?;
+    let outline_font = if let Some(path) = &cfg.sticker.outline_font_path {
+        let bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("failed to read outline font {}", path))?;
+        Some(FontArc::try_from_vec(bytes).context("failed to parse outline font")?)
+    } else {
+        None
+    };
 
     let db = Db::open(&cfg.sqlite_path).await?;
     db.init().await?;
@@ -329,6 +345,7 @@ async fn main() -> Result<()> {
         printerd,
         ai,
         font,
+        outline_font,
         user_modes: Arc::new(RwLock::new(std::collections::HashMap::new())),
     });
 
@@ -931,6 +948,13 @@ async fn create_text_sticker(
     let cfg = &state.cfg.sticker;
     let is_banner = matches!(kind, StickerKind::TextBanner | StickerKind::TextBannerOutline);
     let outline_only = matches!(kind, StickerKind::TextOutline | StickerKind::TextBannerOutline);
+    let font_path = font_path_for_kind(cfg, kind);
+    let max_font_size = max_font_size_for_kind(cfg, kind);
+    let fit_font = if outline_only {
+        state.outline_font.as_ref().unwrap_or(&state.font)
+    } else {
+        &state.font
+    };
 
     let (width_px, height_px, x_px, y_px, font_size) = if is_banner {
         let content_height = cfg
@@ -941,14 +965,14 @@ async fn create_text_sticker(
             bail!("configured margins leave no content height for banner mode");
         }
         let (font_size, _) = fit_font_size_by_height(
-            &state.font,
+            fit_font,
             text,
             content_height as f32,
             cfg.min_font_size_px,
-            cfg.max_font_size_px,
+            max_font_size,
             cfg.line_spacing,
         )?;
-        let (text_width, text_height) = measure_text_block(&state.font, text, font_size, cfg.line_spacing);
+        let (text_width, text_height) = measure_text_block(fit_font, text, font_size, cfg.line_spacing);
         let width_px = (cfg.margin_left_px + cfg.margin_right_px + text_width.ceil() as u32 + 2).max(16);
         let y_px = cfg.margin_top_px as i32
             + ((content_height as i32 - text_height.ceil() as i32).max(0) / 2);
@@ -969,11 +993,11 @@ async fn create_text_sticker(
         }
 
         let (font_size, text_height) = fit_font_size(
-            &state.font,
+            fit_font,
             text,
             content_width as f32,
             cfg.min_font_size_px,
-            cfg.max_font_size_px,
+            max_font_size,
             cfg.line_spacing,
         )?;
 
@@ -990,7 +1014,7 @@ async fn create_text_sticker(
 
     let req = RenderTextRequest {
         text: text.to_string(),
-        font_path: cfg.font_path.clone(),
+        font_path,
         width_px,
         height_px,
         x_px,
@@ -1230,7 +1254,7 @@ async fn process_print_action(state: &AppState, user_id: i64, sticker_id: i64) -
             );
             let req = RenderTextRequest {
                 text: sticker.text.clone(),
-                font_path: state.cfg.sticker.font_path.clone(),
+                font_path: font_path_for_kind(&state.cfg.sticker, sticker.kind),
                 width_px: sticker.width_px,
                 height_px: sticker.height_px,
                 x_px: sticker.x_px,
@@ -1340,6 +1364,26 @@ fn fit_font_size(
 
     let (_, h) = measure_text_block(font, text, lo, line_spacing);
     Ok((lo, h.max(min_h)))
+}
+
+fn font_path_for_kind(cfg: &StickerConfig, kind: StickerKind) -> String {
+    let outline = matches!(kind, StickerKind::TextOutline | StickerKind::TextBannerOutline);
+    if outline {
+        cfg.outline_font_path
+            .clone()
+            .unwrap_or_else(|| cfg.font_path.clone())
+    } else {
+        cfg.font_path.clone()
+    }
+}
+
+fn max_font_size_for_kind(cfg: &StickerConfig, kind: StickerKind) -> f32 {
+    let is_banner = matches!(kind, StickerKind::TextBanner | StickerKind::TextBannerOutline);
+    if is_banner {
+        cfg.banner_max_font_size_px.unwrap_or(cfg.max_font_size_px)
+    } else {
+        cfg.max_font_size_px
+    }
 }
 
 fn fit_font_size_by_height(
