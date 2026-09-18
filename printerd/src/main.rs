@@ -126,11 +126,13 @@ enum DitherMethod {
 struct RenderImageRequest {
     image_base64: String,
     width_px: Option<u32>,
+    canvas_width_px: Option<u32>,
     max_height_px: Option<u32>,
     threshold: Option<u8>,
     dither_method: Option<DitherMethod>,
     invert: Option<bool>,
     trim_blank_top_bottom: Option<bool>,
+    preserve_size: Option<bool>,
     density: Option<u8>,
     address: Option<String>,
 }
@@ -386,7 +388,15 @@ async fn render_image(
         return resp;
     }
 
-    let width_px = req.width_px.unwrap_or(MAX_DOTS_PER_LINE as u32);
+    let preserve_size = req.preserve_size.unwrap_or(false);
+    let canvas_width_px = req.canvas_width_px.unwrap_or(MAX_DOTS_PER_LINE as u32);
+    if canvas_width_px == 0 || canvas_width_px as usize > MAX_DOTS_PER_LINE {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("canvas_width_px must be in 1..={}", MAX_DOTS_PER_LINE),
+        );
+    }
+    let width_px = req.width_px.unwrap_or(canvas_width_px);
     if width_px == 0 || width_px as usize > MAX_DOTS_PER_LINE {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -422,15 +432,27 @@ async fn render_image(
         "src_gray",
         &gray,
     );
-    let src_w = gray.width().max(1);
-    let src_h = gray.height().max(1);
-    let mut target_h = ((src_h as f32 * width_px as f32) / src_w as f32).round() as u32;
-    target_h = target_h.max(1);
-    if let Some(max_h) = req.max_height_px {
-        target_h = target_h.min(max_h.max(1));
-    }
-
-    let resized = image::imageops::resize(&gray, width_px, target_h, FilterType::Lanczos3);
+    let resized = if preserve_size {
+        if gray.width() > canvas_width_px {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("image width {} exceeds canvas width {}", gray.width(), canvas_width_px),
+            );
+        }
+        let mut canvas = GrayImage::from_pixel(canvas_width_px, gray.height().max(1), Luma([255]));
+        let x_offset = ((canvas_width_px - gray.width()) / 2) as i64;
+        image::imageops::overlay(&mut canvas, &gray, x_offset, 0);
+        canvas
+    } else {
+        let src_w = gray.width().max(1);
+        let src_h = gray.height().max(1);
+        let mut target_h = ((src_h as f32 * width_px as f32) / src_w as f32).round() as u32;
+        target_h = target_h.max(1);
+        if let Some(max_h) = req.max_height_px {
+            target_h = target_h.min(max_h.max(1));
+        }
+        image::imageops::resize(&gray, width_px, target_h, FilterType::Lanczos3)
+    };
     maybe_dump_debug_image(
         state.debug_image_dir.as_deref(),
         &render_id,

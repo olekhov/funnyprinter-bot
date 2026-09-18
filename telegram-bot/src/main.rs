@@ -165,6 +165,7 @@ enum StickerKind {
     TextBanner,
     TextBannerOutline,
     Image,
+    ImageRaw,
 }
 
 #[derive(Debug, Serialize)]
@@ -199,11 +200,13 @@ struct RenderTextResponse {
 struct RenderImageRequest {
     image_base64: String,
     width_px: u32,
+    canvas_width_px: Option<u32>,
     max_height_px: Option<u32>,
     threshold: u8,
     dither_method: DitherMethod,
     invert: bool,
     trim_blank_top_bottom: bool,
+    preserve_size: bool,
     density: u8,
     address: Option<String>,
 }
@@ -621,6 +624,44 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
                     bot.send_message(msg.chat.id, format!("Ошибка обработки изображения: {err}"))
                         .await?;
                 }
+            }
+        }
+    }
+
+    if let Some(document) = msg.document() {
+        let mode = {
+            let modes = state.user_modes.read().await;
+            modes
+                .get(&user_id)
+                .copied()
+                .unwrap_or(InputMode::SimpleText)
+        };
+
+        if mode == InputMode::SimpleText {
+            let mime_ok = document
+                .mime_type
+                .as_ref()
+                .map(|m| m.essence_str() == "image/png")
+                .unwrap_or(false);
+            if mime_ok {
+                match create_raw_document_sticker(&bot, &state, user_id, msg.chat.id.0, document).await {
+                    Ok(record) => {
+                        info!(user_id = user_id, sticker_id = record.id, "created raw document preview");
+                        bot.send_photo(
+                            msg.chat.id,
+                            InputFile::memory(record.preview_png.clone()).file_name("preview.png"),
+                        )
+                        .caption("Превью PNG как документ, пиксель-в-пиксель.\nНажмите кнопку для печати.")
+                        .reply_markup(print_keyboard(record.id))
+                        .await?;
+                    }
+                    Err(err) => {
+                        error!(user_id = user_id, error = %err, "failed to create raw document preview");
+                        bot.send_message(msg.chat.id, format!("Ошибка обработки PNG: {err}"))
+                            .await?;
+                    }
+                }
+                return Ok(());
             }
         }
     }
@@ -1093,11 +1134,45 @@ async fn create_image_sticker(
     );
     let bytes = reqwest::get(file_url)
         .await
-        .context("failed to download telegram image")?
+        .context("failed to download telegram file")?
         .bytes()
         .await
-        .context("failed to read telegram image body")?;
+        .context("failed to read telegram file body")?;
     create_image_sticker_from_bytes(state, user_id, chat_id, "Изображение", bytes.to_vec()).await
+}
+
+async fn create_raw_document_sticker(
+    bot: &Bot,
+    state: &AppState,
+    user_id: i64,
+    chat_id: i64,
+    document: &teloxide::types::Document,
+) -> Result<StickerRecord> {
+    let file = bot
+        .get_file(document.file.id.clone())
+        .await
+        .context("failed to get telegram file metadata")?;
+    let file_url = format!(
+        "https://api.telegram.org/file/bot{}/{}",
+        state.cfg.telegram_token, file.path
+    );
+    let bytes = reqwest::get(file_url)
+        .await
+        .context("failed to download telegram file")?
+        .bytes()
+        .await
+        .context("failed to read telegram file body")?;
+    create_raw_document_sticker_from_bytes(
+        state,
+        user_id,
+        chat_id,
+        document
+            .file_name
+            .as_deref()
+            .unwrap_or("Документ PNG"),
+        bytes.to_vec(),
+    )
+    .await
 }
 
 async fn create_ai_image_sticker(
@@ -1180,11 +1255,13 @@ async fn create_image_sticker_from_bytes_with_options(
     let req = RenderImageRequest {
         image_base64: base64::engine::general_purpose::STANDARD.encode(&source),
         width_px: state.cfg.sticker.printer_width_px,
+        canvas_width_px: None,
         max_height_px: None,
         threshold,
         dither_method,
         invert,
         trim_blank_top_bottom: image_cfg.trim_blank_top_bottom,
+        preserve_size: false,
         density: image_cfg.density,
         address: state.cfg.printerd.address.clone(),
     };
@@ -1219,6 +1296,85 @@ async fn create_image_sticker_from_bytes_with_options(
         kind: StickerKind::Image,
         text: title.to_string(),
         width_px: render.width_px,
+        height_px: render.height_px,
+        x_px: 0,
+        y_px: 0,
+        font_size_px: 0.0,
+        threshold: req.threshold,
+        invert: req.invert,
+        trim_blank_top_bottom: req.trim_blank_top_bottom,
+        density: req.density,
+        dither_method: Some(req.dither_method),
+        source_image_bytes: Some(source),
+        preview_png,
+        created_at: "now".to_string(),
+    })
+}
+
+async fn create_raw_document_sticker_from_bytes(
+    state: &AppState,
+    user_id: i64,
+    chat_id: i64,
+    title: &str,
+    source: Vec<u8>,
+) -> Result<StickerRecord> {
+    let image = image::load_from_memory(&source).context("invalid png image")?;
+    if image.color().has_color() {
+        bail!("expected black-and-white PNG document");
+    }
+    if image.width() > state.cfg.sticker.printer_width_px {
+        bail!(
+            "image width {} exceeds printer width {}",
+            image.width(),
+            state.cfg.sticker.printer_width_px
+        );
+    }
+
+    let image_cfg = &state.cfg.image_sticker;
+    let req = RenderImageRequest {
+        image_base64: base64::engine::general_purpose::STANDARD.encode(&source),
+        width_px: image.width(),
+        canvas_width_px: Some(state.cfg.sticker.printer_width_px),
+        max_height_px: Some(image.height()),
+        threshold: 127,
+        dither_method: DitherMethod::Threshold,
+        invert: false,
+        trim_blank_top_bottom: false,
+        preserve_size: true,
+        density: image_cfg.density,
+        address: state.cfg.printerd.address.clone(),
+    };
+
+    let render = state.printerd.render_image(&req).await?;
+    let preview_png = state.printerd.get_preview(&render.preview_url).await?;
+
+    let id = state
+        .db
+        .insert_sticker(NewSticker {
+            user_id,
+            chat_id,
+            kind: StickerKind::ImageRaw,
+            text: title.to_string(),
+            width_px: req.width_px,
+            height_px: render.height_px,
+            x_px: 0,
+            y_px: 0,
+            font_size_px: 0.0,
+            threshold: req.threshold,
+            invert: req.invert,
+            trim_blank_top_bottom: req.trim_blank_top_bottom,
+            density: req.density,
+            dither_method: Some(req.dither_method),
+            source_image_bytes: Some(source.clone()),
+            preview_png: preview_png.clone(),
+        })
+        .await?;
+
+    Ok(StickerRecord {
+        id,
+        kind: StickerKind::ImageRaw,
+        text: title.to_string(),
+        width_px: req.width_px,
         height_px: render.height_px,
         x_px: 0,
         y_px: 0,
@@ -1272,14 +1428,20 @@ async fn process_print_action(state: &AppState, user_id: i64, sticker_id: i64) -
             };
             state.printerd.render_text(&req).await?
         }
-        StickerKind::Image => {
+        StickerKind::Image | StickerKind::ImageRaw => {
             let source = sticker
                 .source_image_bytes
                 .clone()
                 .ok_or_else(|| anyhow!("missing source image in history"))?;
+            let preserve_size = matches!(sticker.kind, StickerKind::ImageRaw);
             let req = RenderImageRequest {
                 image_base64: base64::engine::general_purpose::STANDARD.encode(source),
                 width_px: sticker.width_px.max(1),
+                canvas_width_px: if preserve_size {
+                    Some(state.cfg.sticker.printer_width_px)
+                } else {
+                    None
+                },
                 max_height_px: Some(sticker.height_px.max(1)),
                 threshold: sticker.threshold,
                 dither_method: sticker
@@ -1287,6 +1449,7 @@ async fn process_print_action(state: &AppState, user_id: i64, sticker_id: i64) -
                     .unwrap_or(DitherMethod::FloydSteinberg),
                 invert: sticker.invert,
                 trim_blank_top_bottom: sticker.trim_blank_top_bottom,
+                preserve_size,
                 density: sticker.density,
                 address: state.cfg.printerd.address.clone(),
             };
@@ -1523,6 +1686,7 @@ fn map_menu_button_to_command(text: &str) -> Option<Command> {
 fn parse_kind(kind: String) -> StickerKind {
     match kind.as_str() {
         "image" => StickerKind::Image,
+        "image_raw" => StickerKind::ImageRaw,
         "text_outline" => StickerKind::TextOutline,
         "text_banner" => StickerKind::TextBanner,
         "text_banner_outline" => StickerKind::TextBannerOutline,
@@ -1939,6 +2103,7 @@ impl Db {
                             StickerKind::TextBanner => "text_banner",
                             StickerKind::TextBannerOutline => "text_banner_outline",
                             StickerKind::Image => "image",
+                            StickerKind::ImageRaw => "image_raw",
                         },
                         s.text,
                         s.width_px as i64,

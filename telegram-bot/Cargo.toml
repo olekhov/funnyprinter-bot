@@ -18,3 +18,4 @@ serde_json = "1"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 base64 = "0.22"
+image.workspace = true
