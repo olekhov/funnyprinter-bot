@@ -83,6 +83,11 @@ fn outline_from_mask(src: &GrayImage, radius: u32) -> GrayImage {
 
     for y in 0..h {
         for x in 0..w {
+            // Keep only inner edge pixels (inside glyph), this produces a thinner contour.
+            let center = src.get_pixel(x, y).0[0];
+            if center >= 200 {
+                continue;
+            }
             let mut has_fg = false;
             let mut has_bg = false;
             for dy in -r..=r {

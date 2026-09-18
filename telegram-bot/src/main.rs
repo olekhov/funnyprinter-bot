@@ -48,6 +48,7 @@ struct PrinterdConfig {
 #[derive(Debug, Clone, Deserialize)]
 struct StickerConfig {
     font_path: String,
+    outline_font_path: Option<String>,
     printer_width_px: u32,
     margin_left_px: u32,
     margin_right_px: u32,
@@ -55,6 +56,7 @@ struct StickerConfig {
     margin_bottom_px: u32,
     min_font_size_px: f32,
     max_font_size_px: f32,
+    banner_max_font_size_px: Option<f32>,
     line_spacing: f32,
     threshold: u8,
     density: u8,
@@ -110,6 +112,7 @@ struct AppState {
     printerd: PrinterdClient,
     ai: AiServiceClient,
     font: FontArc,
+    outline_font: Option<FontArc>,
     user_modes: Arc<RwLock<std::collections::HashMap<i64, InputMode>>>,
 }
 
@@ -162,6 +165,7 @@ enum StickerKind {
     TextBanner,
     TextBannerOutline,
     Image,
+    ImageRaw,
 }
 
 #[derive(Debug, Serialize)]
@@ -196,11 +200,13 @@ struct RenderTextResponse {
 struct RenderImageRequest {
     image_base64: String,
     width_px: u32,
+    canvas_width_px: Option<u32>,
     max_height_px: Option<u32>,
     threshold: u8,
     dither_method: DitherMethod,
     invert: bool,
     trim_blank_top_bottom: bool,
+    preserve_size: bool,
     density: u8,
     address: Option<String>,
 }
@@ -305,11 +311,24 @@ async fn main() -> Result<()> {
     if cfg.sticker.printer_width_px == 0 {
         bail!("sticker.printer_width_px must be > 0");
     }
+    if let Some(v) = cfg.sticker.banner_max_font_size_px {
+        if v < cfg.sticker.min_font_size_px {
+            bail!("sticker.banner_max_font_size_px must be >= sticker.min_font_size_px");
+        }
+    }
 
     let font_bytes = tokio::fs::read(&cfg.sticker.font_path)
         .await
         .with_context(|| format!("failed to read font {}", cfg.sticker.font_path))?;
     let font = FontArc::try_from_vec(font_bytes).context("failed to parse font")?;
+    let outline_font = if let Some(path) = &cfg.sticker.outline_font_path {
+        let bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("failed to read outline font {}", path))?;
+        Some(FontArc::try_from_vec(bytes).context("failed to parse outline font")?)
+    } else {
+        None
+    };
 
     let db = Db::open(&cfg.sqlite_path).await?;
     db.init().await?;
@@ -329,6 +348,7 @@ async fn main() -> Result<()> {
         printerd,
         ai,
         font,
+        outline_font,
         user_modes: Arc::new(RwLock::new(std::collections::HashMap::new())),
     });
 
@@ -604,6 +624,44 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
                     bot.send_message(msg.chat.id, format!("Ошибка обработки изображения: {err}"))
                         .await?;
                 }
+            }
+        }
+    }
+
+    if let Some(document) = msg.document() {
+        let mode = {
+            let modes = state.user_modes.read().await;
+            modes
+                .get(&user_id)
+                .copied()
+                .unwrap_or(InputMode::SimpleText)
+        };
+
+        if mode == InputMode::SimpleText {
+            let mime_ok = document
+                .mime_type
+                .as_ref()
+                .map(|m| m.essence_str() == "image/png")
+                .unwrap_or(false);
+            if mime_ok {
+                match create_raw_document_sticker(&bot, &state, user_id, msg.chat.id.0, document).await {
+                    Ok(record) => {
+                        info!(user_id = user_id, sticker_id = record.id, "created raw document preview");
+                        bot.send_photo(
+                            msg.chat.id,
+                            InputFile::memory(record.preview_png.clone()).file_name("preview.png"),
+                        )
+                        .caption("Превью PNG как документ, пиксель-в-пиксель.\nНажмите кнопку для печати.")
+                        .reply_markup(print_keyboard(record.id))
+                        .await?;
+                    }
+                    Err(err) => {
+                        error!(user_id = user_id, error = %err, "failed to create raw document preview");
+                        bot.send_message(msg.chat.id, format!("Ошибка обработки PNG: {err}"))
+                            .await?;
+                    }
+                }
+                return Ok(());
             }
         }
     }
@@ -931,6 +989,13 @@ async fn create_text_sticker(
     let cfg = &state.cfg.sticker;
     let is_banner = matches!(kind, StickerKind::TextBanner | StickerKind::TextBannerOutline);
     let outline_only = matches!(kind, StickerKind::TextOutline | StickerKind::TextBannerOutline);
+    let font_path = font_path_for_kind(cfg, kind);
+    let max_font_size = max_font_size_for_kind(cfg, kind);
+    let fit_font = if outline_only {
+        state.outline_font.as_ref().unwrap_or(&state.font)
+    } else {
+        &state.font
+    };
 
     let (width_px, height_px, x_px, y_px, font_size) = if is_banner {
         let content_height = cfg
@@ -941,14 +1006,14 @@ async fn create_text_sticker(
             bail!("configured margins leave no content height for banner mode");
         }
         let (font_size, _) = fit_font_size_by_height(
-            &state.font,
+            fit_font,
             text,
             content_height as f32,
             cfg.min_font_size_px,
-            cfg.max_font_size_px,
+            max_font_size,
             cfg.line_spacing,
         )?;
-        let (text_width, text_height) = measure_text_block(&state.font, text, font_size, cfg.line_spacing);
+        let (text_width, text_height) = measure_text_block(fit_font, text, font_size, cfg.line_spacing);
         let width_px = (cfg.margin_left_px + cfg.margin_right_px + text_width.ceil() as u32 + 2).max(16);
         let y_px = cfg.margin_top_px as i32
             + ((content_height as i32 - text_height.ceil() as i32).max(0) / 2);
@@ -969,11 +1034,11 @@ async fn create_text_sticker(
         }
 
         let (font_size, text_height) = fit_font_size(
-            &state.font,
+            fit_font,
             text,
             content_width as f32,
             cfg.min_font_size_px,
-            cfg.max_font_size_px,
+            max_font_size,
             cfg.line_spacing,
         )?;
 
@@ -990,7 +1055,7 @@ async fn create_text_sticker(
 
     let req = RenderTextRequest {
         text: text.to_string(),
-        font_path: cfg.font_path.clone(),
+        font_path,
         width_px,
         height_px,
         x_px,
@@ -1069,11 +1134,45 @@ async fn create_image_sticker(
     );
     let bytes = reqwest::get(file_url)
         .await
-        .context("failed to download telegram image")?
+        .context("failed to download telegram file")?
         .bytes()
         .await
-        .context("failed to read telegram image body")?;
+        .context("failed to read telegram file body")?;
     create_image_sticker_from_bytes(state, user_id, chat_id, "Изображение", bytes.to_vec()).await
+}
+
+async fn create_raw_document_sticker(
+    bot: &Bot,
+    state: &AppState,
+    user_id: i64,
+    chat_id: i64,
+    document: &teloxide::types::Document,
+) -> Result<StickerRecord> {
+    let file = bot
+        .get_file(document.file.id.clone())
+        .await
+        .context("failed to get telegram file metadata")?;
+    let file_url = format!(
+        "https://api.telegram.org/file/bot{}/{}",
+        state.cfg.telegram_token, file.path
+    );
+    let bytes = reqwest::get(file_url)
+        .await
+        .context("failed to download telegram file")?
+        .bytes()
+        .await
+        .context("failed to read telegram file body")?;
+    create_raw_document_sticker_from_bytes(
+        state,
+        user_id,
+        chat_id,
+        document
+            .file_name
+            .as_deref()
+            .unwrap_or("Документ PNG"),
+        bytes.to_vec(),
+    )
+    .await
 }
 
 async fn create_ai_image_sticker(
@@ -1156,11 +1255,13 @@ async fn create_image_sticker_from_bytes_with_options(
     let req = RenderImageRequest {
         image_base64: base64::engine::general_purpose::STANDARD.encode(&source),
         width_px: state.cfg.sticker.printer_width_px,
+        canvas_width_px: None,
         max_height_px: None,
         threshold,
         dither_method,
         invert,
         trim_blank_top_bottom: image_cfg.trim_blank_top_bottom,
+        preserve_size: false,
         density: image_cfg.density,
         address: state.cfg.printerd.address.clone(),
     };
@@ -1210,6 +1311,85 @@ async fn create_image_sticker_from_bytes_with_options(
     })
 }
 
+async fn create_raw_document_sticker_from_bytes(
+    state: &AppState,
+    user_id: i64,
+    chat_id: i64,
+    title: &str,
+    source: Vec<u8>,
+) -> Result<StickerRecord> {
+    let image = image::load_from_memory(&source).context("invalid png image")?;
+    if image.color().has_color() {
+        bail!("expected black-and-white PNG document");
+    }
+    if image.width() > state.cfg.sticker.printer_width_px {
+        bail!(
+            "image width {} exceeds printer width {}",
+            image.width(),
+            state.cfg.sticker.printer_width_px
+        );
+    }
+
+    let image_cfg = &state.cfg.image_sticker;
+    let req = RenderImageRequest {
+        image_base64: base64::engine::general_purpose::STANDARD.encode(&source),
+        width_px: image.width(),
+        canvas_width_px: Some(state.cfg.sticker.printer_width_px),
+        max_height_px: Some(image.height()),
+        threshold: 127,
+        dither_method: DitherMethod::Threshold,
+        invert: false,
+        trim_blank_top_bottom: false,
+        preserve_size: true,
+        density: image_cfg.density,
+        address: state.cfg.printerd.address.clone(),
+    };
+
+    let render = state.printerd.render_image(&req).await?;
+    let preview_png = state.printerd.get_preview(&render.preview_url).await?;
+
+    let id = state
+        .db
+        .insert_sticker(NewSticker {
+            user_id,
+            chat_id,
+            kind: StickerKind::ImageRaw,
+            text: title.to_string(),
+            width_px: req.width_px,
+            height_px: render.height_px,
+            x_px: 0,
+            y_px: 0,
+            font_size_px: 0.0,
+            threshold: req.threshold,
+            invert: req.invert,
+            trim_blank_top_bottom: req.trim_blank_top_bottom,
+            density: req.density,
+            dither_method: Some(req.dither_method),
+            source_image_bytes: Some(source.clone()),
+            preview_png: preview_png.clone(),
+        })
+        .await?;
+
+    Ok(StickerRecord {
+        id,
+        kind: StickerKind::ImageRaw,
+        text: title.to_string(),
+        width_px: req.width_px,
+        height_px: render.height_px,
+        x_px: 0,
+        y_px: 0,
+        font_size_px: 0.0,
+        threshold: req.threshold,
+        invert: req.invert,
+        trim_blank_top_bottom: req.trim_blank_top_bottom,
+        density: req.density,
+        dither_method: Some(req.dither_method),
+        source_image_bytes: Some(source),
+        preview_png,
+        created_at: "now".to_string(),
+    })
+}
+
 async fn process_print_action(state: &AppState, user_id: i64, sticker_id: i64) -> Result<String> {
     let Some(sticker) = state.db.get_sticker_for_user(sticker_id, user_id).await? else {
         bail!("стикер не найден");
@@ -1230,7 +1410,7 @@ async fn process_print_action(state: &AppState, user_id: i64, sticker_id: i64) -
             );
             let req = RenderTextRequest {
                 text: sticker.text.clone(),
-                font_path: state.cfg.sticker.font_path.clone(),
+                font_path: font_path_for_kind(&state.cfg.sticker, sticker.kind),
                 width_px: sticker.width_px,
                 height_px: sticker.height_px,
                 x_px: sticker.x_px,
@@ -1248,14 +1428,20 @@ async fn process_print_action(state: &AppState, user_id: i64, sticker_id: i64) -
             };
             state.printerd.render_text(&req).await?
         }
-        StickerKind::Image => {
+        StickerKind::Image | StickerKind::ImageRaw => {
             let source = sticker
                 .source_image_bytes
                 .clone()
                 .ok_or_else(|| anyhow!("missing source image in history"))?;
+            let preserve_size = matches!(sticker.kind, StickerKind::ImageRaw);
             let req = RenderImageRequest {
                 image_base64: base64::engine::general_purpose::STANDARD.encode(source),
                 width_px: sticker.width_px.max(1),
+                canvas_width_px: if preserve_size {
+                    Some(state.cfg.sticker.printer_width_px)
+                } else {
+                    None
+                },
                 max_height_px: Some(sticker.height_px.max(1)),
                 threshold: sticker.threshold,
                 dither_method: sticker
@@ -1263,6 +1449,7 @@ async fn process_print_action(state: &AppState, user_id: i64, sticker_id: i64) -
                     .unwrap_or(DitherMethod::FloydSteinberg),
                 invert: sticker.invert,
                 trim_blank_top_bottom: sticker.trim_blank_top_bottom,
+                preserve_size,
                 density: sticker.density,
                 address: state.cfg.printerd.address.clone(),
             };
@@ -1340,6 +1527,26 @@ fn fit_font_size(
 
     let (_, h) = measure_text_block(font, text, lo, line_spacing);
     Ok((lo, h.max(min_h)))
+}
+
+fn font_path_for_kind(cfg: &StickerConfig, kind: StickerKind) -> String {
+    let outline = matches!(kind, StickerKind::TextOutline | StickerKind::TextBannerOutline);
+    if outline {
+        cfg.outline_font_path
+            .clone()
+            .unwrap_or_else(|| cfg.font_path.clone())
+    } else {
+        cfg.font_path.clone()
+    }
+}
+
+fn max_font_size_for_kind(cfg: &StickerConfig, kind: StickerKind) -> f32 {
+    let is_banner = matches!(kind, StickerKind::TextBanner | StickerKind::TextBannerOutline);
+    if is_banner {
+        cfg.banner_max_font_size_px.unwrap_or(cfg.max_font_size_px)
+    } else {
+        cfg.max_font_size_px
+    }
 }
 
 fn fit_font_size_by_height(
@@ -1479,6 +1686,7 @@ fn map_menu_button_to_command(text: &str) -> Option<Command> {
 fn parse_kind(kind: String) -> StickerKind {
     match kind.as_str() {
         "image" => StickerKind::Image,
+        "image_raw" => StickerKind::ImageRaw,
         "text_outline" => StickerKind::TextOutline,
         "text_banner" => StickerKind::TextBanner,
         "text_banner_outline" => StickerKind::TextBannerOutline,
@@ -1895,6 +2103,7 @@ impl Db {
                             StickerKind::TextBanner => "text_banner",
                             StickerKind::TextBannerOutline => "text_banner_outline",
                             StickerKind::Image => "image",
+                            StickerKind::ImageRaw => "image_raw",
                         },
                         s.text,
                         s.width_px as i64,
