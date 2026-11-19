@@ -20,8 +20,8 @@ use axum::{
 use base64::Engine;
 use clap::Parser;
 use funnyprint_proto::{
-    MAX_DOTS_PER_LINE, PackedLine, PrinterUnreachable, discover_candidates, dpi, print_job,
-    reset_adapter,
+    MAX_DOTS_PER_LINE, PackedLine, PrintReport, PrinterUnreachable, discover_candidates, dpi,
+    packed_lines_to_mm, print_job, reset_adapter,
 };
 use funnyprint_render::{TextRenderOptions, image_to_packed_lines, px_to_mm, render_text_to_image};
 use image::{DynamicImage, GrayImage, ImageFormat, Luma, imageops::FilterType};
@@ -87,6 +87,12 @@ struct JobRecord {
     density: u8,
     status: JobStatus,
     error: Option<String>,
+    /// Length of paper the raster occupies, filled in once the job is done.
+    printed_mm: Option<f32>,
+    /// Battery level the printer reported during the job (as sent by the printer, presumably %).
+    battery: Option<u8>,
+    no_paper: Option<bool>,
+    overheat: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -603,6 +609,10 @@ async fn queue_print(
         density,
         status: JobStatus::Queued,
         error: None,
+        printed_mm: None,
+        battery: None,
+        no_paper: None,
+        overheat: None,
     };
     state.jobs.write().await.insert(job_id.clone(), record);
     info!(
@@ -709,17 +719,28 @@ async fn worker_loop(state: AppState, mut rx: mpsc::Receiver<PrintCommand>) {
         };
 
         let result = match packed {
-            Some(lines) => print_with_recovery(&state, &cmd, &lines).await,
+            Some(lines) => print_with_recovery(&state, &cmd, &lines)
+                .await
+                .map(|report| (report, packed_lines_to_mm(lines.len()))),
             None => Err(anyhow::anyhow!("render {} not found", cmd.render_id)),
         };
 
         let mut jobs = state.jobs.write().await;
         if let Some(job) = jobs.get_mut(&cmd.job_id) {
             match result {
-                Ok(()) => {
+                Ok((report, printed_mm)) => {
                     job.status = JobStatus::Done;
                     job.error = None;
-                    info!(job_id = %cmd.job_id, "print job completed");
+                    job.printed_mm = Some(printed_mm);
+                    job.battery = report.status.map(|st| st.battery);
+                    job.no_paper = report.status.map(|st| st.no_paper);
+                    job.overheat = report.status.map(|st| st.overheat);
+                    info!(
+                        job_id = %cmd.job_id,
+                        printed_mm = printed_mm,
+                        battery = ?job.battery,
+                        "print job completed"
+                    );
                 }
                 Err(err) => {
                     job.status = JobStatus::Failed;
@@ -737,9 +758,9 @@ async fn print_with_recovery(
     state: &AppState,
     cmd: &PrintCommand,
     lines: &[PackedLine],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PrintReport> {
     let err = match print_job(&cmd.address, lines, cmd.density).await {
-        Ok(()) => return Ok(()),
+        Ok(report) => return Ok(report),
         Err(err) => err,
     };
     if !state.adapter_reset || err.downcast_ref::<PrinterUnreachable>().is_none() {

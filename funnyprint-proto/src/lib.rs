@@ -50,6 +50,22 @@ enum NotifyEvent {
 
 pub type PackedLine = [u8; PACKED_LINE_BYTES];
 
+/// Each packed line carries two raster rows.
+pub const ROWS_PER_PACKED_LINE: usize = 2;
+
+/// Paper length occupied by `packed_lines` packed lines, in millimetres
+/// (raster only; any extra feed the printer adds on its own is not counted).
+pub fn packed_lines_to_mm(packed_lines: usize) -> f32 {
+    (packed_lines * ROWS_PER_PACKED_LINE) as f32 * 25.4 / dpi() as f32
+}
+
+/// Outcome of a successful print session.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PrintReport {
+    /// Last status the printer reported during the session (battery etc.), if any.
+    pub status: Option<StatusEvent>,
+}
+
 /// The printer could not be found or connected to. Nothing has been sent to it yet,
 /// so the job is safe to retry (e.g. after resetting the BLE adapter).
 #[derive(Debug, thiserror::Error)]
@@ -99,7 +115,7 @@ pub async fn discover_candidates(scan_time: Duration) -> Result<Vec<PrinterInfo>
     Ok(out)
 }
 
-pub async fn print_job(address: &str, lines: &[PackedLine], density: u8) -> Result<()> {
+pub async fn print_job(address: &str, lines: &[PackedLine], density: u8) -> Result<PrintReport> {
     if density > 7 {
         bail!("density must be in range 0..=7");
     }
@@ -126,10 +142,13 @@ pub async fn print_job(address: &str, lines: &[PackedLine], density: u8) -> Resu
 
     let result = run_session(&peripheral, address, lines, density).await;
     match result {
-        Ok(()) => peripheral
-            .disconnect()
-            .await
-            .context("failed to disconnect cleanly"),
+        Ok(report) => {
+            peripheral
+                .disconnect()
+                .await
+                .context("failed to disconnect cleanly")?;
+            Ok(report)
+        }
         Err(err) => {
             // Don't leave a dangling LE link behind: it can wedge the adapter.
             let _ = peripheral.disconnect().await;
@@ -143,7 +162,8 @@ async fn run_session(
     address: &str,
     lines: &[PackedLine],
     density: u8,
-) -> Result<()> {
+) -> Result<PrintReport> {
+    let mut report = PrintReport::default();
     peripheral
         .discover_services()
         .await
@@ -162,14 +182,14 @@ async fn run_session(
 
     write(peripheral, &write_char, &hardware_info_packet()).await?;
     write(peripheral, &write_char, &handshake_0a_packet()).await?;
-    wait_for_handshake_0a(&mut notifications).await?;
+    wait_for_handshake_0a(&mut notifications, &mut report).await?;
     write(
         peripheral,
         &write_char,
         &handshake_0b_packet(address).context("failed to build handshake 0b")?,
     )
     .await?;
-    wait_for_handshake_0b_ok(&mut notifications).await?;
+    wait_for_handshake_0b_ok(&mut notifications, &mut report).await?;
 
     write(peripheral, &write_char, &density_packet(density)).await?;
     write(
@@ -196,6 +216,7 @@ async fn run_session(
                     break;
                 }
                 NotifyEvent::Status(st) => {
+                    report.status = Some(st);
                     if st.overheat {
                         eprintln!("warning: printer overheat reported");
                     }
@@ -235,7 +256,21 @@ async fn run_session(
     )
     .await?;
 
-    Ok(())
+    // Some firmwares send a final status after the end-of-job packet; pick it up briefly.
+    let drain_deadline = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < drain_deadline {
+        match timeout(Duration::from_millis(100), notifications.next()).await {
+            Ok(Some(note)) => {
+                if let NotifyEvent::Status(st) = parse_notify(&note) {
+                    report.status = Some(st);
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+
+    Ok(report)
 }
 
 async fn default_adapter() -> Result<Adapter> {
@@ -434,33 +469,37 @@ fn parse_notify(note: &ValueNotification) -> NotifyEvent {
     }
 }
 
-async fn wait_for_handshake_0a<S>(stream: &mut S) -> Result<()>
+async fn wait_for_handshake_0a<S>(stream: &mut S, report: &mut PrintReport) -> Result<()>
 where
     S: futures::Stream<Item = ValueNotification> + Unpin,
 {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Ok(Some(note)) = timeout(Duration::from_millis(500), stream.next()).await {
-            if matches!(parse_notify(&note), NotifyEvent::Handshake0a) {
-                return Ok(());
+            match parse_notify(&note) {
+                NotifyEvent::Handshake0a => return Ok(()),
+                NotifyEvent::Status(st) => report.status = Some(st),
+                _ => {}
             }
         }
     }
     bail!("timeout waiting for handshake 0x5a0a response")
 }
 
-async fn wait_for_handshake_0b_ok<S>(stream: &mut S) -> Result<()>
+async fn wait_for_handshake_0b_ok<S>(stream: &mut S, report: &mut PrintReport) -> Result<()>
 where
     S: futures::Stream<Item = ValueNotification> + Unpin,
 {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Ok(Some(note)) = timeout(Duration::from_millis(500), stream.next()).await {
-            if let NotifyEvent::Handshake0b { ok } = parse_notify(&note) {
-                if ok {
-                    return Ok(());
+            match parse_notify(&note) {
+                NotifyEvent::Handshake0b { ok: true } => return Ok(()),
+                NotifyEvent::Handshake0b { ok: false } => {
+                    bail!("printer rejected handshake 0x5a0b response")
                 }
-                bail!("printer rejected handshake 0x5a0b response");
+                NotifyEvent::Status(st) => report.status = Some(st),
+                _ => {}
             }
         }
     }

@@ -35,6 +35,14 @@ struct Config {
     sticker: StickerConfig,
     image_sticker: ImageStickerConfig,
     access: AccessConfig,
+    #[serde(default)]
+    paper: PaperConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PaperConfig {
+    /// Full roll length; when set, the post-print summary also shows what's left.
+    roll_length_mm: Option<f32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -252,6 +260,29 @@ struct PrintResponse {
 struct JobResponse {
     status: String,
     error: Option<String>,
+    #[serde(default)]
+    printed_mm: Option<f32>,
+    #[serde(default)]
+    battery: Option<u8>,
+    #[serde(default)]
+    no_paper: Option<bool>,
+}
+
+/// Result of a completed print, used for the summary message.
+struct PrintOutcome {
+    job_id: String,
+    printed_mm: Option<f32>,
+    battery: Option<u8>,
+    no_paper: bool,
+    roll: RollUsage,
+}
+
+/// Paper consumed since the last "new roll" mark (or since tracking began).
+struct RollUsage {
+    /// `None` if no roll has been marked yet.
+    started_at: Option<String>,
+    used_mm: f64,
+    prints: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -280,6 +311,8 @@ enum Command {
     History,
     #[command(description = "статистика AI и пользователей")]
     Stats,
+    #[command(rename = "new_roll", description = "вставил новый рулон ленты")]
+    NewRoll,
     #[command(description = "список пользователей (admin)")]
     Users,
     #[command(description = "добавить пользователя: /user_add <telegram_user_id> (admin)")]
@@ -682,7 +715,7 @@ async fn handle_command(
         Command::Help | Command::Start => {
             bot.send_message(
                 msg.chat.id,
-                "Режимы:\n• 🏷 Простой стикер: отправьте текст.\n• ✏️ Контур текста: буквы без заливки.\n• 🧾 Баннер: печать вдоль ленты.\n• 🧾✏️ Баннер контуром.\n• 🤖 ИИ картинка: отправьте описание изображения.\nТакже можно отправить готовую картинку.\n• 📊 Статистика: пользователи и токены AI.\nПосле превью нажмите Печатать.",
+                "Режимы:\n• 🏷 Простой стикер: отправьте текст.\n• ✏️ Контур текста: буквы без заливки.\n• 🧾 Баннер: печать вдоль ленты.\n• 🧾✏️ Баннер контуром.\n• 🤖 ИИ картинка: отправьте описание изображения.\nТакже можно отправить готовую картинку.\n• 📊 Статистика: пользователи, токены AI, расход ленты.\n• 🧻 Новый рулон: отметьте, когда вставили новую ленту.\nПосле превью нажмите Печатать.",
             )
             .reply_markup(main_menu_keyboard())
             .await?;
@@ -774,6 +807,21 @@ async fn handle_command(
                     .await?;
             }
         },
+        Command::NewRoll => {
+            let text = match state.db.current_roll_usage().await {
+                Ok(usage) => format!(
+                    "Отметить, что вставлен новый рулон ленты?\nТекущий рулон: {}.",
+                    describe_roll_usage(&usage)
+                ),
+                Err(err) => {
+                    warn!(error = %err, "failed to load roll usage");
+                    "Отметить, что вставлен новый рулон ленты?".to_string()
+                }
+            };
+            bot.send_message(msg.chat.id, text)
+                .reply_markup(new_roll_confirm_keyboard())
+                .await?;
+        }
         Command::Stats => match state.db.ai_stats().await {
             Ok(stats) => {
                 let mut text = format!(
@@ -784,6 +832,15 @@ async fn handle_command(
                     stats.input_tokens,
                     stats.output_tokens
                 );
+                if let Ok(usage) = state.db.current_roll_usage().await {
+                    text.push_str(&format!(
+                        "\nЛента: {}",
+                        describe_roll_usage(&usage)
+                    ));
+                    if let Some(left) = roll_left_text(&state.cfg.paper, &usage) {
+                        text.push_str(&format!(", {left}"));
+                    }
+                }
                 if !stats.by_user.is_empty() {
                     text.push_str("\n\nТоп по токенам:");
                     for row in stats.by_user.iter().take(10) {
@@ -913,6 +970,47 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
         return Ok(());
     }
 
+    if data == "new_roll_confirm" || data == "new_roll_cancel" {
+        let confirmed = data == "new_roll_confirm";
+        let text = if !confirmed {
+            "Ок, рулон не меняем.".to_string()
+        } else {
+            match state.db.start_new_roll(user_id).await {
+                Ok(prev) => {
+                    info!(
+                        user_id = user_id,
+                        prev_used_mm = prev.used_mm,
+                        prev_prints = prev.prints,
+                        "new paper roll marked"
+                    );
+                    let mut t = "🧻 Новый рулон отмечен, счётчик ленты обнулён.".to_string();
+                    if prev.prints > 0 {
+                        t.push_str(&format!(
+                            "\nПредыдущий рулон: {}.\nЕсли он закончился полностью, это и есть примерная длина рулона.",
+                            describe_roll_usage(&prev)
+                        ));
+                    }
+                    t
+                }
+                Err(err) => {
+                    bot.answer_callback_query(q.id)
+                        .show_alert(true)
+                        .text(format!("Ошибка: {err}"))
+                        .await?;
+                    return Ok(());
+                }
+            }
+        };
+        bot.answer_callback_query(q.id).await?;
+        if let Some(message) = q.message {
+            let _ = bot
+                .edit_message_text(message.chat().id, message.id(), text)
+                .reply_markup(InlineKeyboardMarkup::default())
+                .await;
+        }
+        return Ok(());
+    }
+
     let Some((action, id_str)) = data.split_once(':') else {
         return Ok(());
     };
@@ -957,15 +1055,20 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
     let result = process_print_action(&state, user_id, sticker_id).await;
 
     match result {
-        Ok(job_id) => {
+        Ok(outcome) => {
             bot.answer_callback_query(q.id.clone())
-                .text(format!("Задание отправлено: {job_id}"))
+                .text(format!("Напечатано ({})", outcome.job_id))
                 .await?;
             if let Some(message) = q.message {
+                let chat_id = message.chat().id;
                 let _ = bot
-                    .edit_message_reply_markup(message.chat().id, message.id())
+                    .edit_message_reply_markup(chat_id, message.id())
                     .reply_markup(history_item_keyboard(sticker_id))
                     .await;
+                let summary = print_summary_text(&state.cfg.paper, &outcome);
+                if let Err(err) = bot.send_message(chat_id, summary).await {
+                    warn!(error = %err, "failed to send print summary");
+                }
             }
         }
         Err(err) => {
@@ -1390,7 +1493,11 @@ async fn create_raw_document_sticker_from_bytes(
     })
 }
 
-async fn process_print_action(state: &AppState, user_id: i64, sticker_id: i64) -> Result<String> {
+async fn process_print_action(
+    state: &AppState,
+    user_id: i64,
+    sticker_id: i64,
+) -> Result<PrintOutcome> {
     let Some(sticker) = state.db.get_sticker_for_user(sticker_id, user_id).await? else {
         bail!("стикер не найден");
     };
@@ -1484,15 +1591,94 @@ async fn process_print_action(state: &AppState, user_id: i64, sticker_id: i64) -
         .db
         .set_last_print_job(sticker_id, &print_resp.job_id)
         .await?;
+    // Paper accounting must not turn a successful print into an error.
+    if let Err(err) = state
+        .db
+        .log_print(user_id, sticker_id, &print_resp.job_id, job.printed_mm, job.battery)
+        .await
+    {
+        warn!(error = %err, "failed to log print");
+    }
+    let roll = state.db.current_roll_usage().await.unwrap_or_else(|err| {
+        warn!(error = %err, "failed to load roll usage");
+        RollUsage {
+            started_at: None,
+            used_mm: 0.0,
+            prints: 0,
+        }
+    });
 
     info!(
         user_id = user_id,
         sticker_id = sticker_id,
         job_id = %print_resp.job_id,
+        printed_mm = ?job.printed_mm,
+        battery = ?job.battery,
+        roll_used_mm = roll.used_mm,
         "sticker printed"
     );
 
-    Ok(print_resp.job_id)
+    Ok(PrintOutcome {
+        job_id: print_resp.job_id,
+        printed_mm: job.printed_mm,
+        battery: job.battery,
+        no_paper: job.no_paper.unwrap_or(false),
+        roll,
+    })
+}
+
+fn format_length_mm(mm: f64) -> String {
+    if mm >= 1000.0 {
+        format!("{:.2} м", mm / 1000.0)
+    } else if mm >= 100.0 {
+        format!("{:.0} см", mm / 10.0)
+    } else {
+        format!("{:.1} см", mm / 10.0)
+    }
+}
+
+fn describe_roll_usage(usage: &RollUsage) -> String {
+    let since = match &usage.started_at {
+        Some(ts) => format!("с {}", ts.get(..10).unwrap_or(ts)),
+        None => "с начала учёта".to_string(),
+    };
+    format!(
+        "израсходовано {} ({} печатей, {since})",
+        format_length_mm(usage.used_mm),
+        usage.prints
+    )
+}
+
+fn roll_left_text(paper: &PaperConfig, usage: &RollUsage) -> Option<String> {
+    let total = paper.roll_length_mm? as f64;
+    usage.started_at.as_ref()?;
+    let left = (total - usage.used_mm).max(0.0);
+    let pct = if total > 0.0 { left / total * 100.0 } else { 0.0 };
+    Some(format!("осталось ≈ {} ({pct:.0}%)", format_length_mm(left)))
+}
+
+fn print_summary_text(paper: &PaperConfig, outcome: &PrintOutcome) -> String {
+    let mut lines = Vec::new();
+    match outcome.printed_mm {
+        Some(mm) => lines.push(format!("✅ Напечатано: {}", format_length_mm(mm as f64))),
+        None => lines.push("✅ Напечатано".to_string()),
+    }
+    let mut roll = format!("🧻 Рулон: {}", describe_roll_usage(&outcome.roll));
+    if let Some(left) = roll_left_text(paper, &outcome.roll) {
+        roll.push_str(&format!(", {left}"));
+    }
+    lines.push(roll);
+    match outcome.battery {
+        Some(b) => lines.push(format!("🔋 Батарея: {b}%")),
+        None => lines.push("🔋 Батарея: принтер не сообщил".to_string()),
+    }
+    if outcome.no_paper {
+        lines.push("⚠️ Принтер сообщает, что лента закончилась".to_string());
+    }
+    if outcome.roll.started_at.is_none() {
+        lines.push("Когда вставите новый рулон, нажмите «🧻 Новый рулон».".to_string());
+    }
+    lines.join("\n")
 }
 
 fn fit_font_size(
@@ -1647,6 +1833,13 @@ fn clear_history_keyboard() -> InlineKeyboardMarkup {
     )]])
 }
 
+fn new_roll_confirm_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback("Да, новый рулон", "new_roll_confirm"),
+        InlineKeyboardButton::callback("Отмена", "new_roll_cancel"),
+    ]])
+}
+
 fn main_menu_keyboard() -> KeyboardMarkup {
     KeyboardMarkup::new(vec![
         vec![
@@ -1664,6 +1857,7 @@ fn main_menu_keyboard() -> KeyboardMarkup {
         ],
         vec![
             KeyboardButton::new("🤖 ИИ картинка"),
+            KeyboardButton::new("🧻 Новый рулон"),
         ],
     ])
     .resize_keyboard()
@@ -1679,6 +1873,7 @@ fn map_menu_button_to_command(text: &str) -> Option<Command> {
         "🧾 Баннер" => Some(Command::Banner),
         "🧾✏️ Баннер контуром" => Some(Command::BannerOutline),
         "🤖 ИИ картинка" => Some(Command::Ai),
+        "🧻 Новый рулон" => Some(Command::NewRoll),
         _ => None,
     }
 }
@@ -1955,6 +2150,22 @@ impl Db {
                         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
                     );
                     CREATE INDEX IF NOT EXISTS idx_ai_generations_user_created ON ai_generations(user_id, id DESC);
+                    CREATE TABLE IF NOT EXISTS paper_rolls (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        started_by INTEGER NOT NULL,
+                        started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                    );
+                    CREATE TABLE IF NOT EXISTS prints (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        sticker_id INTEGER NOT NULL,
+                        job_id TEXT NOT NULL,
+                        roll_id INTEGER,
+                        printed_mm REAL,
+                        battery INTEGER,
+                        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_prints_roll ON prints(roll_id);
                     ",
                 )?;
                 // Migrations for existing DBs.
@@ -2308,6 +2519,51 @@ impl Db {
             .map_err(|e| anyhow!("failed to update print job id: {e}"))
     }
 
+    async fn log_print(
+        &self,
+        user_id: i64,
+        sticker_id: i64,
+        job_id: &str,
+        printed_mm: Option<f32>,
+        battery: Option<u8>,
+    ) -> Result<()> {
+        let jid = job_id.to_string();
+        self.conn
+            .call(move |conn| -> rusqlite::Result<()> {
+                conn.execute(
+                    "INSERT INTO prints (user_id, sticker_id, job_id, roll_id, printed_mm, battery)
+                     VALUES (?1, ?2, ?3, (SELECT MAX(id) FROM paper_rolls), ?4, ?5)",
+                    (user_id, sticker_id, jid, printed_mm.map(f64::from), battery),
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow!("failed to log print: {e}"))
+    }
+
+    async fn current_roll_usage(&self) -> Result<RollUsage> {
+        self.conn
+            .call(|conn| -> rusqlite::Result<RollUsage> {
+                roll_usage_tx(conn)
+            })
+            .await
+            .map_err(|e| anyhow!("failed to load roll usage: {e}"))
+    }
+
+    /// Marks a new roll and returns the usage of the roll it replaces.
+    async fn start_new_roll(&self, user_id: i64) -> Result<RollUsage> {
+        self.conn
+            .call(move |conn| -> rusqlite::Result<RollUsage> {
+                let tx = conn.transaction()?;
+                let prev = roll_usage_tx(&tx)?;
+                tx.execute("INSERT INTO paper_rolls (started_by) VALUES (?1)", [user_id])?;
+                tx.commit()?;
+                Ok(prev)
+            })
+            .await
+            .map_err(|e| anyhow!("failed to start new roll: {e}"))
+    }
+
     async fn delete_sticker_for_user(&self, id: i64, user_id: i64) -> Result<bool> {
         self.conn
             .call(move |conn| -> rusqlite::Result<bool> {
@@ -2330,4 +2586,29 @@ impl Db {
             .await
             .map_err(|e| anyhow!("failed to clear history: {e}"))
     }
+}
+
+fn roll_usage_tx(conn: &rusqlite::Connection) -> rusqlite::Result<RollUsage> {
+    let current: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, started_at FROM paper_rolls ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            e => Err(e),
+        })?;
+    let roll_id = current.as_ref().map(|(id, _)| *id);
+    let (used_mm, prints): (f64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(printed_mm), 0), COUNT(*) FROM prints WHERE roll_id IS ?1",
+        [roll_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(RollUsage {
+        started_at: current.map(|(_, ts)| ts),
+        used_mm,
+        prints: prints as u64,
+    })
 }

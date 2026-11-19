@@ -35,5 +35,10 @@ density = 3
 invert = false
 trim_blank_top_bottom = false
 
+[paper]
+# Full roll length in mm. Unknown yet: leave commented out; the bot then only
+# reports how much tape was used since the last "🧻 Новый рулон" mark.
+# roll_length_mm = 5000
+
 [access]
 allowed_user_ids = [123456789, 987654321]

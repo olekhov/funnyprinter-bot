@@ -108,6 +108,8 @@ async fn main() -> Result<()> {
                 threshold,
                 invert,
                 trim_blank_top_bottom: !no_trim_blank,
+                outline_only: false,
+                outline_thickness_px: 1,
             };
 
             let img = render_text_to_image(&text, &font, &opts)?;
@@ -134,8 +136,15 @@ async fn main() -> Result<()> {
                 bail!("image became empty after trimming blank lines; nothing to print")
             }
 
-            print_job(&address, &packed, density).await?;
+            let report = print_job(&address, &packed, density).await?;
             println!("Print job sent to {}", address);
+            println!(
+                "Printed: {:.1} mm",
+                funnyprint_proto::packed_lines_to_mm(packed.len())
+            );
+            if let Some(st) = report.status {
+                println!("Battery: {}%", st.battery);
+            }
         }
     }
 
