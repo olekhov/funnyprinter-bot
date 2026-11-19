@@ -50,6 +50,14 @@ enum NotifyEvent {
 
 pub type PackedLine = [u8; PACKED_LINE_BYTES];
 
+/// The printer could not be found or connected to. Nothing has been sent to it yet,
+/// so the job is safe to retry (e.g. after resetting the BLE adapter).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct PrinterUnreachable(pub String);
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
 pub fn dpi() -> u16 {
     203
 }
@@ -101,16 +109,47 @@ pub async fn print_job(address: &str, lines: &[PackedLine], density: u8) -> Resu
 
     let adapter = default_adapter().await?;
     let peripheral = find_peripheral_by_address(&adapter, address, Duration::from_secs(4)).await?;
-    peripheral
-        .connect()
-        .await
-        .with_context(|| format!("failed to connect to {address}"))?;
+    match timeout(CONNECT_TIMEOUT, peripheral.connect()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            return Err(PrinterUnreachable(format!("failed to connect to {address}: {err}")).into());
+        }
+        Err(_) => {
+            let _ = peripheral.disconnect().await;
+            return Err(PrinterUnreachable(format!(
+                "timed out connecting to {address} after {}s",
+                CONNECT_TIMEOUT.as_secs()
+            ))
+            .into());
+        }
+    }
+
+    let result = run_session(&peripheral, address, lines, density).await;
+    match result {
+        Ok(()) => peripheral
+            .disconnect()
+            .await
+            .context("failed to disconnect cleanly"),
+        Err(err) => {
+            // Don't leave a dangling LE link behind: it can wedge the adapter.
+            let _ = peripheral.disconnect().await;
+            Err(err)
+        }
+    }
+}
+
+async fn run_session(
+    peripheral: &Peripheral,
+    address: &str,
+    lines: &[PackedLine],
+    density: u8,
+) -> Result<()> {
     peripheral
         .discover_services()
         .await
         .context("failed to discover services")?;
 
-    let (write_char, read_char) = resolve_chars(&peripheral)?;
+    let (write_char, read_char) = resolve_chars(peripheral)?;
 
     peripheral
         .subscribe(&read_char)
@@ -121,20 +160,20 @@ pub async fn print_job(address: &str, lines: &[PackedLine], density: u8) -> Resu
         .await
         .context("failed to create notifications stream")?;
 
-    write(&peripheral, &write_char, &hardware_info_packet()).await?;
-    write(&peripheral, &write_char, &handshake_0a_packet()).await?;
+    write(peripheral, &write_char, &hardware_info_packet()).await?;
+    write(peripheral, &write_char, &handshake_0a_packet()).await?;
     wait_for_handshake_0a(&mut notifications).await?;
     write(
-        &peripheral,
+        peripheral,
         &write_char,
         &handshake_0b_packet(address).context("failed to build handshake 0b")?,
     )
     .await?;
     wait_for_handshake_0b_ok(&mut notifications).await?;
 
-    write(&peripheral, &write_char, &density_packet(density)).await?;
+    write(peripheral, &write_char, &density_packet(density)).await?;
     write(
-        &peripheral,
+        peripheral,
         &write_char,
         &print_event_packet(lines.len() as u16, false),
     )
@@ -171,7 +210,7 @@ pub async fn print_job(address: &str, lines: &[PackedLine], density: u8) -> Resu
 
         if cur_line < lines.len() {
             write(
-                &peripheral,
+                peripheral,
                 &write_char,
                 &print_line_packet(cur_line as u16, &lines[cur_line]),
             )
@@ -190,16 +229,12 @@ pub async fn print_job(address: &str, lines: &[PackedLine], density: u8) -> Resu
     }
 
     write(
-        &peripheral,
+        peripheral,
         &write_char,
         &print_event_packet(lines.len() as u16, true),
     )
     .await?;
 
-    peripheral
-        .disconnect()
-        .await
-        .context("failed to disconnect cleanly")?;
     Ok(())
 }
 
@@ -245,6 +280,7 @@ async fn find_peripheral_by_address(
                 continue;
             };
             if normalize(&props.address.to_string()) == target {
+                let _ = adapter.stop_scan().await;
                 return Ok(p);
             }
         }
@@ -256,7 +292,59 @@ async fn find_peripheral_by_address(
         sleep(Duration::from_millis(250)).await;
     }
 
-    bail!("BLE device with address {address} not found")
+    let _ = adapter.stop_scan().await;
+    Err(PrinterUnreachable(format!("BLE device with address {address} not found")).into())
+}
+
+/// Power-cycles the default BlueZ adapter via D-Bus (`busctl`), equivalent to
+/// `bluetoothctl power off && bluetoothctl power on`. Some controllers (e.g. old
+/// Broadcom BT 4.0 in Mac minis) stop reporting advertisements after a failed LE
+/// connect, and only a power cycle brings them back.
+pub async fn reset_adapter() -> Result<()> {
+    let adapter = default_adapter().await?;
+    let info = adapter
+        .adapter_info()
+        .await
+        .context("failed to query adapter info")?;
+    let name = info
+        .split_whitespace()
+        .next()
+        .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric()))
+        .ok_or_else(|| anyhow!("cannot parse adapter name from {info:?}"))?
+        .to_string();
+    drop(adapter);
+
+    set_adapter_powered(&name, false).await?;
+    sleep(Duration::from_secs(2)).await;
+    set_adapter_powered(&name, true).await?;
+    // Give the controller time to come back up before scanning again.
+    sleep(Duration::from_secs(2)).await;
+    Ok(())
+}
+
+async fn set_adapter_powered(name: &str, on: bool) -> Result<()> {
+    let path = format!("/org/bluez/{name}");
+    let output = tokio::process::Command::new("busctl")
+        .args([
+            "--system",
+            "set-property",
+            "org.bluez",
+            &path,
+            "org.bluez.Adapter1",
+            "Powered",
+            "b",
+            if on { "true" } else { "false" },
+        ])
+        .output()
+        .await
+        .context("failed to run busctl")?;
+    if !output.status.success() {
+        bail!(
+            "busctl set Powered={on} on {path} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 fn resolve_chars(peripheral: &Peripheral) -> Result<(Characteristic, Characteristic)> {

@@ -19,7 +19,10 @@ use axum::{
 };
 use base64::Engine;
 use clap::Parser;
-use funnyprint_proto::{MAX_DOTS_PER_LINE, PackedLine, discover_candidates, dpi, print_job};
+use funnyprint_proto::{
+    MAX_DOTS_PER_LINE, PackedLine, PrinterUnreachable, discover_candidates, dpi, print_job,
+    reset_adapter,
+};
 use funnyprint_render::{TextRenderOptions, image_to_packed_lines, px_to_mm, render_text_to_image};
 use image::{DynamicImage, GrayImage, ImageFormat, Luma, imageops::FilterType};
 use serde::{Deserialize, Serialize};
@@ -41,6 +44,9 @@ struct Args {
     api_token: Option<String>,
     #[arg(long)]
     debug_image_dir: Option<PathBuf>,
+    /// Don't power-cycle the BLE adapter and retry when the printer is unreachable.
+    #[arg(long)]
+    no_adapter_reset: bool,
 }
 
 #[derive(Clone)]
@@ -53,6 +59,7 @@ struct AppState {
     job_seq: Arc<AtomicU64>,
     queue_tx: mpsc::Sender<PrintCommand>,
     debug_image_dir: Option<PathBuf>,
+    adapter_reset: bool,
 }
 
 #[derive(Clone)]
@@ -199,6 +206,7 @@ async fn main() -> anyhow::Result<()> {
         job_seq: Arc::new(AtomicU64::new(1)),
         queue_tx: tx,
         debug_image_dir: args.debug_image_dir,
+        adapter_reset: !args.no_adapter_reset,
     };
 
     tokio::spawn(worker_loop(state.clone(), rx));
@@ -701,7 +709,7 @@ async fn worker_loop(state: AppState, mut rx: mpsc::Receiver<PrintCommand>) {
         };
 
         let result = match packed {
-            Some(lines) => print_job(&cmd.address, &lines, cmd.density).await,
+            Some(lines) => print_with_recovery(&state, &cmd, &lines).await,
             None => Err(anyhow::anyhow!("render {} not found", cmd.render_id)),
         };
 
@@ -721,6 +729,30 @@ async fn worker_loop(state: AppState, mut rx: mpsc::Receiver<PrintCommand>) {
             }
         }
     }
+}
+
+/// Runs a print job; if the printer can't be found or connected to, power-cycles
+/// the BLE adapter and retries once. Retrying is safe: nothing reached the printer.
+async fn print_with_recovery(
+    state: &AppState,
+    cmd: &PrintCommand,
+    lines: &[PackedLine],
+) -> anyhow::Result<()> {
+    let err = match print_job(&cmd.address, lines, cmd.density).await {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+    if !state.adapter_reset || err.downcast_ref::<PrinterUnreachable>().is_none() {
+        return Err(err);
+    }
+
+    warn!(job_id = %cmd.job_id, error = %err, "printer unreachable, resetting BLE adapter");
+    if let Err(reset_err) = reset_adapter().await {
+        error!(job_id = %cmd.job_id, error = %reset_err, "BLE adapter reset failed");
+        return Err(err.context(format!("adapter reset failed: {reset_err}")));
+    }
+    info!(job_id = %cmd.job_id, "BLE adapter reset, retrying print job");
+    print_job(&cmd.address, lines, cmd.density).await
 }
 
 fn encode_png(image: &GrayImage) -> anyhow::Result<Vec<u8>> {
